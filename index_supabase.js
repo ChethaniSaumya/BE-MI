@@ -2931,11 +2931,11 @@ app.delete('/api/cart/user/:userId', async (req, res) => {
 // =====================================================
 // ORDER APIS
 // =====================================================
-
-// Checkout with Stripe Connect
+/*
+----------KAKAO, NEVER PAY + ETC K-Pay METHODS---------
 app.post('/api/checkout', async (req, res) => {
     try {
-        const { userId, items } = req.body;
+        const { userId, items, currency = 'usd' } = req.body;  // Accept currency parameter
         
         if (!userId || !items || items.length === 0) {
             return res.status(400).json({
@@ -2950,6 +2950,20 @@ app.post('/api/checkout', async (req, res) => {
             .select('email')
             .eq('id', userId)
             .single();
+
+        // Determine currency and payment methods
+        const isKRW = currency.toLowerCase() === 'krw';
+        const exchangeRate = parseFloat(process.env.USD_TO_KRW_RATE) || 1450;
+        
+        // Set payment methods based on currency
+        let paymentMethodTypes;
+        if (isKRW) {
+            // KRW supports Kakao Pay, Naver Pay, Korean cards, and international cards
+            paymentMethodTypes = ['card', 'kakao_pay', 'kr_card', 'naver_pay', 'samsung_pay', 'payco'];
+        } else {
+            // USD only supports card payments
+            paymentMethodTypes = ['card'];
+        }
 
         // Build line items and calculate transfers
         const lineItems = [];
@@ -2980,21 +2994,50 @@ app.post('/api/checkout', async (req, res) => {
                 });
             }
 
-            // Calculate price based on license
-            let price = track.track_price || 0;
+            // Calculate price based on license (in USD)
+            let priceUSD = track.track_price || 0;
             if (item.licenseType === 'commercial') {
-                price = track.commercial_price || price * 2.5;
+                priceUSD = track.commercial_price || priceUSD * 2.5;
             } else if (item.licenseType === 'exclusive') {
-                price = track.exclusive_price || price * 10;
+                priceUSD = track.exclusive_price || priceUSD * 10;
             }
 
-            const unitAmount = Math.round(price * 100); // Convert to cents
-            const platformFee = Math.round(price * 0.15 * 100); // 15% platform fee in cents
-            const sellerAmount = unitAmount - platformFee;
+            // Convert to KRW if needed
+            let price = priceUSD;
+            let unitAmount;
+            
+            if (isKRW) {
+                // Convert USD to KRW (no decimals for KRW)
+                price = Math.round(priceUSD * exchangeRate);
+                unitAmount = price; // KRW doesn't use cents
+            } else {
+                unitAmount = Math.round(price * 100); // USD uses cents
+            }
+
+            // Calculate fees
+            const platformFeePercent = 0.15;
+            const platformFee = Math.round(price * platformFeePercent * (isKRW ? 1 : 100));
+            
+            // Stripe fee: 2.9% + $0.30 (or equivalent in KRW)
+            const stripeFeePercent = 0.029;
+            const stripeFeeFixed = isKRW ? 435 : 30; // ~$0.30 in KRW
+            const stripeFee = Math.round((price * stripeFeePercent * (isKRW ? 1 : 100)) + stripeFeeFixed);
+            
+            // Seller amount after fees
+            const sellerAmount = unitAmount - platformFee - stripeFee;
+
+            console.log('=== FEE CALCULATION ===');
+            console.log('Currency:', isKRW ? 'KRW' : 'USD');
+            console.log('Price:', price, isKRW ? 'KRW' : 'USD');
+            console.log('Unit Amount:', unitAmount);
+            console.log('Platform Fee:', platformFee);
+            console.log('Stripe Fee:', stripeFee);
+            console.log('Seller Amount:', sellerAmount);
+            console.log('=======================');
 
             lineItems.push({
                 price_data: {
-                    currency: 'usd',
+                    currency: isKRW ? 'krw' : 'usd',
                     product_data: {
                         name: track.track_name,
                         description: `${item.licenseType.charAt(0).toUpperCase() + item.licenseType.slice(1)} License`,
@@ -3008,17 +3051,20 @@ app.post('/api/checkout', async (req, res) => {
             orderData.push({
                 trackId: item.trackId,
                 licenseType: item.licenseType,
-                price: price,
+                priceUSD: priceUSD,           // Original USD price
+                price: isKRW ? price : priceUSD, // Price in transaction currency
+                currency: isKRW ? 'krw' : 'usd',
                 sellerId: track.creator_id,
                 sellerStripeAccountId: track.creator.stripe_account_id,
-                platformFee: platformFee / 100,
-                sellerEarnings: sellerAmount / 100
+                platformFee: platformFee / (isKRW ? 1 : 100),
+                stripeFee: stripeFee / (isKRW ? 1 : 100),
+                sellerEarnings: sellerAmount / (isKRW ? 1 : 100)
             });
         }
 
-        // Create Stripe Checkout Session with transfers
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
+        // Create Stripe Checkout Session with appropriate payment methods
+        const sessionConfig = {
+            payment_method_types: paymentMethodTypes,
             line_items: lineItems,
             mode: 'payment',
             success_url: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/payment/success?session_id={CHECKOUT_SESSION_ID}`,
@@ -3026,18 +3072,193 @@ app.post('/api/checkout', async (req, res) => {
             customer_email: buyer?.email,
             metadata: {
                 userId: userId,
-                orderData: JSON.stringify(orderData)
+                orderData: JSON.stringify(orderData),
+                currency: isKRW ? 'krw' : 'usd'
             },
             payment_intent_data: {
-                // This enables automatic transfers after payment
                 transfer_group: `ORDER-${Date.now()}`
             }
-        });
+        };
+
+        const session = await stripe.checkout.sessions.create(sessionConfig);
+
+        console.log('Checkout session created with payment methods:', paymentMethodTypes);
 
         res.json({
             success: true,
             sessionId: session.id,
-            url: session.url
+            url: session.url,
+            currency: isKRW ? 'krw' : 'usd',
+            paymentMethods: paymentMethodTypes
+        });
+
+    } catch (error) {
+        console.error('Checkout error:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});*/
+
+app.post('/api/checkout', async (req, res) => {
+    try {
+        const { userId, items, currency = 'usd' } = req.body;
+        
+        if (!userId || !items || items.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'User ID and items are required'
+            });
+        }
+
+        // Get buyer email
+        const { data: buyer } = await supabase
+            .from('users')
+            .select('email')
+            .eq('id', userId)
+            .single();
+
+        // Determine currency and payment methods
+        const isKRW = currency.toLowerCase() === 'krw';
+        const exchangeRate = parseFloat(process.env.USD_TO_KRW_RATE) || 1450;
+        
+        // Set payment methods based on currency
+        // ONLY Card for USD, ONLY Kakao Pay + Card for KRW
+        let paymentMethodTypes;
+        if (isKRW) {
+            paymentMethodTypes = ['kakao_pay', 'card'];
+            // Commented out other Korean payment methods:
+            // 'kr_card', 'naver_pay', 'samsung_pay', 'payco'
+        } else {
+            paymentMethodTypes = ['card'];
+        }
+
+        // Build line items and calculate transfers
+        const lineItems = [];
+        const orderData = [];
+
+        for (const item of items) {
+            // Get track with creator's Stripe account
+            const { data: track } = await supabase
+                .from('tracks')
+                .select(`
+                    *,
+                    creator:users!tracks_creator_id_fkey (
+                        id,
+                        stripe_account_id,
+                        stripe_payouts_enabled
+                    )
+                `)
+                .eq('id', item.trackId)
+                .single();
+
+            if (!track) continue;
+
+            // Check if creator has Stripe connected
+            if (!track.creator?.stripe_account_id || !track.creator?.stripe_payouts_enabled) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Creator for track "${track.track_name}" has not set up payouts. Please contact the creator.`
+                });
+            }
+
+            // Calculate price based on license (in USD)
+            let priceUSD = track.track_price || 0;
+            if (item.licenseType === 'commercial') {
+                priceUSD = track.commercial_price || priceUSD * 2.5;
+            } else if (item.licenseType === 'exclusive') {
+                priceUSD = track.exclusive_price || priceUSD * 10;
+            }
+
+            // Convert to KRW if needed
+            let price = priceUSD;
+            let unitAmount;
+            
+            if (isKRW) {
+                // Convert USD to KRW (no decimals for KRW)
+                price = Math.round(priceUSD * exchangeRate);
+                unitAmount = price; // KRW doesn't use cents
+            } else {
+                unitAmount = Math.round(price * 100); // USD uses cents
+            }
+
+            // Calculate fees
+            const platformFeePercent = 0.15;
+            const platformFee = Math.round(price * platformFeePercent * (isKRW ? 1 : 100));
+            
+            // Stripe fee: 2.9% + $0.30 (or equivalent in KRW)
+            const stripeFeePercent = 0.029;
+            const stripeFeeFixed = isKRW ? 435 : 30; // ~$0.30 in KRW
+            const stripeFee = Math.round((price * stripeFeePercent * (isKRW ? 1 : 100)) + stripeFeeFixed);
+            
+            // Seller amount after fees
+            const sellerAmount = unitAmount - platformFee - stripeFee;
+
+            console.log('=== FEE CALCULATION ===');
+            console.log('Currency:', isKRW ? 'KRW' : 'USD');
+            console.log('Price:', price, isKRW ? 'KRW' : 'USD');
+            console.log('Unit Amount:', unitAmount);
+            console.log('Platform Fee:', platformFee);
+            console.log('Stripe Fee:', stripeFee);
+            console.log('Seller Amount:', sellerAmount);
+            console.log('=======================');
+
+            lineItems.push({
+                price_data: {
+                    currency: isKRW ? 'krw' : 'usd',
+                    product_data: {
+                        name: track.track_name,
+                        description: `${item.licenseType.charAt(0).toUpperCase() + item.licenseType.slice(1)} License`,
+                        images: track.track_image ? [track.track_image] : [],
+                    },
+                    unit_amount: unitAmount,
+                },
+                quantity: 1,
+            });
+
+            orderData.push({
+                trackId: item.trackId,
+                licenseType: item.licenseType,
+                priceUSD: priceUSD,
+                price: isKRW ? price : priceUSD,
+                currency: isKRW ? 'krw' : 'usd',
+                sellerId: track.creator_id,
+                sellerStripeAccountId: track.creator.stripe_account_id,
+                platformFee: platformFee / (isKRW ? 1 : 100),
+                stripeFee: stripeFee / (isKRW ? 1 : 100),
+                sellerEarnings: sellerAmount / (isKRW ? 1 : 100)
+            });
+        }
+
+        // Create Stripe Checkout Session
+        const sessionConfig = {
+            payment_method_types: paymentMethodTypes,
+            line_items: lineItems,
+            mode: 'payment',
+            success_url: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.FRONTEND_URL}/user/pages/Cart`,
+            customer_email: buyer?.email,
+            metadata: {
+                userId: userId,
+                orderData: JSON.stringify(orderData),
+                currency: isKRW ? 'krw' : 'usd'
+            },
+            payment_intent_data: {
+                transfer_group: `ORDER-${Date.now()}`
+            }
+        };
+
+        const session = await stripe.checkout.sessions.create(sessionConfig);
+
+        console.log('Checkout session created with payment methods:', paymentMethodTypes);
+
+        res.json({
+            success: true,
+            sessionId: session.id,
+            url: session.url,
+            currency: isKRW ? 'krw' : 'usd',
+            paymentMethods: paymentMethodTypes
         });
 
     } catch (error) {
@@ -3049,44 +3270,228 @@ app.post('/api/checkout', async (req, res) => {
     }
 });
 
-// Handle successful payment
-// Handle successful payment with Stripe Connect transfers
+app.get('/api/checkout/currency-options', async (req, res) => {
+    try {
+        // You can use IP geolocation or browser locale
+        const acceptLanguage = req.headers['accept-language'] || '';
+        const isKorean = acceptLanguage.includes('ko');
+        
+        res.json({
+            success: true,
+            suggestedCurrency: isKorean ? 'krw' : 'usd',
+            availableCurrencies: [
+                { code: 'usd', name: 'US Dollar', symbol: '$' },
+                { code: 'krw', name: 'Korean Won', symbol: '₩' }
+            ],
+            paymentMethodsByCurrency: {
+                usd: ['card'],
+                krw: ['card', 'kakao_pay', 'naver_pay', 'samsung_pay', 'payco', 'kr_card']
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 app.get('/api/payment/success', async (req, res) => {
     try {
         const { session_id } = req.query;
-        const session = await stripe.checkout.sessions.retrieve(session_id);
+        console.log('=== PAYMENT SUCCESS ===');
+        console.log('Session ID:', session_id);
+        
+        const session = await stripe.checkout.sessions.retrieve(session_id, {
+            expand: ['payment_intent', 'payment_intent.latest_charge']
+        });
+        
+        console.log('Payment status:', session.payment_status);
+        console.log('Payment method types:', session.payment_method_types);
         
         if (session.payment_status === 'paid') {
-            const { userId, orderData } = session.metadata;
+            const { userId, orderData, currency } = session.metadata;
             const items = JSON.parse(orderData);
-            const paymentIntentId = session.payment_intent;
+            const paymentIntentId = session.payment_intent?.id || session.payment_intent;
+            const isKRW = currency === 'krw';
+            
+            console.log('Original currency:', currency);
+            console.log('Payment Intent ID:', paymentIntentId);
+
+            // Get charge and balance transaction details
+            let chargeId = null;
+            let actualAmountReceived = 0;
+            let settlementCurrency = 'usd';
+            
+            try {
+                // Get the payment intent with expanded charge
+                const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId, {
+                    expand: ['latest_charge.balance_transaction']
+                });
+                
+                const charge = paymentIntent.latest_charge;
+                chargeId = typeof charge === 'string' ? charge : charge?.id;
+                
+                console.log('Charge ID:', chargeId);
+                console.log('Charge type:', typeof charge);
+                
+                if (charge && typeof charge === 'object') {
+                    // If charge is expanded, get balance transaction directly
+                    const balanceTransaction = charge.balance_transaction;
+                    
+                    if (balanceTransaction && typeof balanceTransaction === 'object') {
+                        actualAmountReceived = balanceTransaction.net;
+                        settlementCurrency = balanceTransaction.currency;
+                        console.log('Balance transaction (expanded):', balanceTransaction.id);
+                        console.log('Net amount:', actualAmountReceived, settlementCurrency);
+                    } else if (balanceTransaction && typeof balanceTransaction === 'string') {
+                        // Balance transaction is a string ID, need to retrieve it
+                        const bt = await stripe.balanceTransactions.retrieve(balanceTransaction);
+                        actualAmountReceived = bt.net;
+                        settlementCurrency = bt.currency;
+                        console.log('Balance transaction (retrieved):', bt.id);
+                        console.log('Net amount:', actualAmountReceived, settlementCurrency);
+                    } else {
+                        console.log('⚠️ Balance transaction not yet available');
+                    }
+                }
+                
+                // If balance transaction is not available yet (can happen with some payment methods),
+                // calculate from the session amount
+                if (actualAmountReceived === 0 && isKRW) {
+                    // Get the amount from the session and estimate USD conversion
+                    const amountTotal = session.amount_total; // in KRW (smallest unit)
+                    const exchangeRate = parseFloat(process.env.USD_TO_KRW_RATE) || 1450;
+                    
+                    // Convert KRW to USD cents
+                    const estimatedUSDCents = Math.round((amountTotal / exchangeRate) * 100);
+                    
+                    // Estimate Stripe fee (approximately 3.4% + $0.30 for international)
+                    const estimatedStripeFee = Math.round(estimatedUSDCents * 0.034) + 30;
+                    actualAmountReceived = estimatedUSDCents - estimatedStripeFee;
+                    
+                    console.log('=== FALLBACK CALCULATION ===');
+                    console.log('Session amount (KRW):', amountTotal);
+                    console.log('Estimated USD cents:', estimatedUSDCents);
+                    console.log('Estimated Stripe fee:', estimatedStripeFee);
+                    console.log('Estimated net (cents):', actualAmountReceived);
+                    console.log('============================');
+                }
+                
+            } catch (piError) {
+                console.error('Error retrieving payment details:', piError.message);
+                
+                // Fallback: Calculate from session amount
+                if (isKRW && session.amount_total) {
+                    const amountTotal = session.amount_total;
+                    const exchangeRate = parseFloat(process.env.USD_TO_KRW_RATE) || 1450;
+                    const estimatedUSDCents = Math.round((amountTotal / exchangeRate) * 100);
+                    const estimatedStripeFee = Math.round(estimatedUSDCents * 0.034) + 30;
+                    actualAmountReceived = estimatedUSDCents - estimatedStripeFee;
+                    
+                    console.log('=== ERROR FALLBACK CALCULATION ===');
+                    console.log('Session amount (KRW):', amountTotal);
+                    console.log('Estimated net (cents):', actualAmountReceived);
+                    console.log('==================================');
+                }
+            }
+
+            // If we still don't have chargeId, try to get it directly
+            if (!chargeId) {
+                try {
+                    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+                    chargeId = pi.latest_charge;
+                    console.log('Retrieved charge ID separately:', chargeId);
+                } catch (e) {
+                    console.error('Could not retrieve charge ID:', e.message);
+                }
+            }
 
             for (const item of items) {
                 const orderNumber = 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6).toUpperCase();
+                console.log('Processing order:', orderNumber);
 
-                // Create transfer to creator's Stripe account
-                const transferAmount = Math.round(item.sellerEarnings * 100); // Convert to cents
+                let transferAmount;
+                let transferCurrency = settlementCurrency;
                 
-                try {
-                    await stripe.transfers.create({
-                        amount: transferAmount,
-                        currency: 'usd',
-                        destination: item.sellerStripeAccountId,
-                        source_transaction: paymentIntentId,
-                        metadata: {
-                            orderId: orderNumber,
-                            trackId: item.trackId,
-                            sellerId: item.sellerId
+                if (isKRW) {
+                    // For KRW payments, calculate based on what platform received
+                    const platformFeeAmount = Math.round(actualAmountReceived * 0.15);
+                    transferAmount = actualAmountReceived - platformFeeAmount;
+                    
+                    console.log('=== TRANSFER CALCULATION (KRW→USD) ===');
+                    console.log('Buyer paid:', item.price, 'KRW');
+                    console.log('Platform received (after Stripe fee):', actualAmountReceived, 'cents USD');
+                    console.log('Platform keeps (15%):', platformFeeAmount, 'cents USD');
+                    console.log('Seller receives:', transferAmount, 'cents USD');
+                    console.log('=======================================');
+                } else {
+                    // For USD payments, use the pre-calculated amount
+                    transferAmount = Math.round(item.sellerEarnings * 100);
+                    
+                    console.log('=== TRANSFER CALCULATION (USD) ===');
+                    console.log('Buyer paid: $', item.price);
+                    console.log('Platform Fee: $', item.platformFee);
+                    console.log('Stripe Fee: $', item.stripeFee);
+                    console.log('Seller Earnings: $', item.sellerEarnings);
+                    console.log('Transfer Amount (cents):', transferAmount);
+                    console.log('==================================');
+                }
+                
+                // Create transfer to seller
+                if (chargeId && item.sellerStripeAccountId && transferAmount > 0) {
+                    try {
+                        const transfer = await stripe.transfers.create({
+                            amount: transferAmount,
+                            currency: transferCurrency,
+                            destination: item.sellerStripeAccountId,
+                            source_transaction: chargeId,
+                            metadata: {
+                                orderId: orderNumber,
+                                trackId: item.trackId,
+                                sellerId: item.sellerId,
+                                originalCurrency: currency,
+                                originalAmount: item.price
+                            }
+                        });
+                        console.log('✅ Transfer successful:', transfer.id, '- Amount:', transferAmount, transferCurrency.toUpperCase());
+                    } catch (transferError) {
+                        console.error('❌ Transfer error:', transferError.message);
+                        
+                        // If source_transaction fails, try without it (separate transfer)
+                        if (transferError.message.includes('source_transaction')) {
+                            try {
+                                console.log('Attempting transfer without source_transaction...');
+                                const transfer = await stripe.transfers.create({
+                                    amount: transferAmount,
+                                    currency: transferCurrency,
+                                    destination: item.sellerStripeAccountId,
+                                    metadata: {
+                                        orderId: orderNumber,
+                                        trackId: item.trackId,
+                                        sellerId: item.sellerId,
+                                        originalCurrency: currency,
+                                        originalAmount: item.price,
+                                        note: 'Transfer without source_transaction'
+                                    }
+                                });
+                                console.log('✅ Transfer successful (without source):', transfer.id);
+                            } catch (transferError2) {
+                                console.error('❌ Transfer error (retry):', transferError2.message);
+                            }
                         }
-                    });
-                } catch (transferError) {
-                    console.error('Transfer error:', transferError);
-                    // Continue with order creation even if transfer fails
-                    // You may want to flag this for manual review
+                    }
+                } else {
+                    console.log('⚠️ Skipping transfer - missing data or zero amount');
+                    console.log('  chargeId:', chargeId);
+                    console.log('  sellerStripeAccountId:', item.sellerStripeAccountId);
+                    console.log('  transferAmount:', transferAmount);
                 }
 
-                // Create order
-                const { data: order } = await supabase
+                // Calculate seller earnings in USD for database
+                const sellerEarningsUSD = isKRW 
+                    ? (transferAmount / 100)
+                    : item.sellerEarnings;
+
+                // Create order record
+                const { data: order, error: orderError } = await supabase
                     .from('orders')
                     .insert([{
                         order_number: orderNumber,
@@ -3094,30 +3499,51 @@ app.get('/api/payment/success', async (req, res) => {
                         seller_id: item.sellerId,
                         track_id: item.trackId,
                         license_type: item.licenseType,
-                        base_price: item.price,
-                        platform_fee: item.platformFee,
-                        seller_earnings: item.sellerEarnings,
-                        total_amount: item.price,
+                        base_price: item.priceUSD || (item.price / (parseFloat(process.env.USD_TO_KRW_RATE) || 1450)),
+                        platform_fee: isKRW ? (actualAmountReceived * 0.15 / 100) : item.platformFee,
+                        stripe_fee: item.stripeFee || 0,
+                        seller_earnings: sellerEarningsUSD,
+                        total_amount: item.priceUSD || (item.price / (parseFloat(process.env.USD_TO_KRW_RATE) || 1450)),
+                        currency: currency,
                         status: 'completed',
                         payment_provider: 'stripe',
+                        payment_method: isKRW ? 'kakao_pay' : 'card',
                         payment_reference: paymentIntentId
                     }])
                     .select()
                     .single();
 
-                // INSERT creator earnings
-                await supabase
-                    .from('creator_earnings')
-                    .insert([{
-                        user_id: item.sellerId,
-                        order_id: order.id,
-                        track_id: item.trackId,
-                        amount: item.sellerEarnings,
-                        status: 'transferred' // Changed to 'transferred' since money goes directly
-                    }]);
+                if (orderError) {
+                    console.error('❌ Order creation error:', orderError);
+                } else {
+                    console.log('✅ Order created:', order.id);
+                }
+
+                // Record creator earnings
+                if (order) {
+                    await supabase
+                        .from('creator_earnings')
+                        .insert([{
+                            user_id: item.sellerId,
+                            order_id: order.id,
+                            track_id: item.trackId,
+                            amount: sellerEarningsUSD,
+                            currency: 'usd',
+                            status: transferAmount > 0 ? 'transferred' : 'pending'
+                        }]);
+                    console.log('✅ Creator earnings recorded: $' + sellerEarningsUSD.toFixed(2));
+                }
 
                 // Update track sales count
-                await supabase.rpc('increment_sales_count', { track_id: item.trackId });
+                const { error: rpcError } = await supabase.rpc('increment_sales_count', { 
+                    track_id: item.trackId 
+                });
+                
+                if (rpcError) {
+                    console.error('❌ Sales count increment error:', rpcError);
+                } else {
+                    console.log('✅ Sales count incremented');
+                }
 
                 // Generate license key
                 const licenseKey = 'MSL-' + 
@@ -3127,15 +3553,18 @@ app.get('/api/payment/success', async (req, res) => {
                     Math.random().toString(36).substr(2, 4).toUpperCase();
 
                 // Add to user library
-                await supabase
-                    .from('user_library')
-                    .insert([{
-                        user_id: userId,
-                        track_id: item.trackId,
-                        order_id: order.id,
-                        license_type: item.licenseType,
-                        license_key: licenseKey
-                    }]);
+                if (order) {
+                    await supabase
+                        .from('user_library')
+                        .insert([{
+                            user_id: userId,
+                            track_id: item.trackId,
+                            order_id: order.id,
+                            license_type: item.licenseType,
+                            license_key: licenseKey
+                        }]);
+                    console.log('✅ Added to user library');
+                }
 
                 // Clear from cart
                 await supabase
@@ -3156,8 +3585,10 @@ app.get('/api/payment/success', async (req, res) => {
                 }
             }
             
+            console.log('=== PAYMENT SUCCESS COMPLETE ===');
             res.redirect(`${process.env.FRONTEND_URL}/user/pages/PaymentSuccess`);
         } else {
+            console.log('Payment not completed, status:', session.payment_status);
             res.redirect(`${process.env.FRONTEND_URL}/user/pages/Cart?error=payment_failed`);
         }
     } catch (error) {
@@ -3464,23 +3895,32 @@ app.get('/api/library/:userId', async (req, res) => {
         const { data: library, error } = await supabase
             .from('user_library')
             .select(`
-                *,
+                id,
+                track_id,
+                license_type,
+                license_key,
+                download_count,
+                purchased_at,
                 tracks (
                     id,
                     track_name,
                     track_image,
                     track_file,
-                    musician,
-                    musician_profile_picture,
                     bpm,
                     track_key,
-                    genre_category,
-                    about
+                    creator:users!tracks_creator_id_fkey (
+                        id,
+                        first_name,
+                        last_name,
+                        profile_picture
+                    )
                 ),
                 orders (
                     id,
                     order_number,
                     total_amount,
+                    base_price,
+                    currency,
                     created_at
                 )
             `)
@@ -3488,19 +3928,48 @@ app.get('/api/library/:userId', async (req, res) => {
             .order('purchased_at', { ascending: false });
 
         if (error) {
-            return handleDatabaseError(error, res, 'get library');
+            console.error('Library fetch error:', error);
+            return res.status(500).json({ success: false, message: error.message });
         }
+
+        // Transform the data
+        const transformedLibrary = library.map(item => ({
+            id: item.id,
+            trackId: item.track_id,
+            licenseType: item.license_type,
+            licenseKey: item.license_key,
+            downloadCount: item.download_count || 0,
+            purchasedAt: item.purchased_at,
+            tracks: item.tracks ? {
+                id: item.tracks.id,
+                trackName: item.tracks.track_name,
+                trackImage: item.tracks.track_image,
+                trackFile: item.tracks.track_file,
+                bpm: item.tracks.bpm,
+                trackKey: item.tracks.track_key,
+                musician: item.tracks.creator 
+                    ? `${item.tracks.creator.first_name} ${item.tracks.creator.last_name}` 
+                    : 'Unknown Artist',
+                musicianProfilePicture: item.tracks.creator?.profile_picture
+            } : null,
+            orders: item.orders ? {
+                id: item.orders.id,
+                orderNumber: item.orders.order_number,
+                totalAmount: item.orders.total_amount,
+                basePrice: item.orders.base_price,
+                currency: item.orders.currency || 'usd',
+                createdAt: item.orders.created_at
+            } : null
+        }));
 
         res.json({
             success: true,
-            library: toCamelCase(library)
+            library: transformedLibrary
         });
+
     } catch (error) {
-        console.error('Get library error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Internal server error'
-        });
+        console.error('Library error:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
@@ -3736,45 +4205,196 @@ app.post('/api/user-tracks', upload.fields([
 app.get('/api/creator/stats/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
+        console.log('Fetching creator stats for user:', userId);
 
-        // Get total tracks
+        // Get total tracks count
         const { data: tracks, error: tracksError } = await supabase
             .from('tracks')
-            .select('id, sales_count, view_count, play_count, track_price')
+            .select('id, view_count, play_count, sales_count')
             .eq('creator_id', userId);
 
-        // Get total earnings
+        if (tracksError) {
+            console.error('Tracks fetch error:', tracksError);
+        }
+
+        const totalTracks = tracks?.length || 0;
+        const totalViews = tracks?.reduce((sum, t) => sum + (t.view_count || 0), 0) || 0;
+        const totalPlays = tracks?.reduce((sum, t) => sum + (t.play_count || 0), 0) || 0;
+        const totalSalesFromTracks = tracks?.reduce((sum, t) => sum + (t.sales_count || 0), 0) || 0;
+
+        // Get earnings from creator_earnings table
         const { data: earnings, error: earningsError } = await supabase
             .from('creator_earnings')
-            .select('amount, status')
+            .select('amount, status, currency, created_at')
             .eq('user_id', userId);
 
-        // Get recent sales
-        const { data: recentSales, error: salesError } = await supabase
+        if (earningsError) {
+            console.error('Earnings fetch error:', earningsError);
+        }
+
+        // Calculate total earnings (convert KRW to USD if needed)
+        const USD_TO_KRW_RATE = 1450;
+        let totalEarnings = 0;
+        let availableBalance = 0;
+        let pendingBalance = 0;
+
+        if (earnings && earnings.length > 0) {
+            earnings.forEach(earning => {
+                let amount = earning.amount || 0;
+                
+                // If amount seems to be in KRW (large number), convert to USD
+                // This handles legacy data that might have been stored incorrectly
+                if (amount > 1000 && earning.currency === 'krw') {
+                    amount = amount / USD_TO_KRW_RATE;
+                }
+                
+                totalEarnings += amount;
+
+                // Check if earning is available (more than 7 days old) or pending
+                const earningDate = new Date(earning.created_at);
+                const sevenDaysAgo = new Date();
+                sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+                if (earning.status === 'transferred' || earningDate < sevenDaysAgo) {
+                    availableBalance += amount;
+                } else {
+                    pendingBalance += amount;
+                }
+            });
+        }
+
+        // Alternative: Get earnings from orders table if creator_earnings is empty
+        if (totalEarnings === 0) {
+            const { data: orders, error: ordersError } = await supabase
+                .from('orders')
+                .select('seller_earnings, base_price, currency, created_at, status')
+                .eq('seller_id', userId)
+                .eq('status', 'completed');
+
+            if (ordersError) {
+                console.error('Orders fetch error:', ordersError);
+            }
+
+            if (orders && orders.length > 0) {
+                orders.forEach(order => {
+                    let amount = order.seller_earnings || 0;
+                    
+                    // If seller_earnings is 0 but we have base_price, calculate it
+                    if (amount === 0 && order.base_price) {
+                        // Seller gets 85% minus Stripe fee
+                        const basePrice = order.base_price;
+                        const platformFee = basePrice * 0.15;
+                        const stripeFee = (basePrice * 0.029) + 0.30;
+                        amount = basePrice - platformFee - stripeFee;
+                    }
+                    
+                    // Handle KRW amounts stored incorrectly
+                    if (amount > 1000 && order.currency === 'krw') {
+                        amount = amount / USD_TO_KRW_RATE;
+                    }
+
+                    totalEarnings += amount;
+
+                    const orderDate = new Date(order.created_at);
+                    const sevenDaysAgo = new Date();
+                    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+                    if (orderDate < sevenDaysAgo) {
+                        availableBalance += amount;
+                    } else {
+                        pendingBalance += amount;
+                    }
+                });
+            }
+        }
+
+        // Get total sales count from orders
+        const { count: salesCount, error: salesCountError } = await supabase
+            .from('orders')
+            .select('id', { count: 'exact', head: true })
+            .eq('seller_id', userId)
+            .eq('status', 'completed');
+
+        if (salesCountError) {
+            console.error('Sales count error:', salesCountError);
+        }
+
+        const totalSales = salesCount || totalSalesFromTracks;
+
+        // Get recent sales with track and buyer info
+        const { data: recentSales, error: recentSalesError } = await supabase
             .from('orders')
             .select(`
-                *,
-                tracks (track_name, track_image),
-                buyer:users!orders_buyer_id_fkey (first_name, last_name)
+                id,
+                order_number,
+                license_type,
+                seller_earnings,
+                base_price,
+                currency,
+                created_at,
+                tracks (
+                    id,
+                    track_name,
+                    track_image
+                ),
+                buyer:users!orders_buyer_id_fkey (
+                    id,
+                    first_name,
+                    last_name
+                )
             `)
             .eq('seller_id', userId)
             .eq('status', 'completed')
             .order('created_at', { ascending: false })
             .limit(10);
 
-        // Calculate stats
-        const totalTracks = tracks?.length || 0;
-        const totalSales = tracks?.reduce((sum, t) => sum + (t.sales_count || 0), 0) || 0;
-        const totalViews = tracks?.reduce((sum, t) => sum + (t.view_count || 0), 0) || 0;
-        const totalPlays = tracks?.reduce((sum, t) => sum + (t.play_count || 0), 0) || 0;
+        if (recentSalesError) {
+            console.error('Recent sales error:', recentSalesError);
+        }
 
-        const totalEarnings = earnings?.reduce((sum, e) => sum + parseFloat(e.amount), 0) || 0;
-        const availableBalance = earnings
-            ?.filter(e => e.status === 'available')
-            .reduce((sum, e) => sum + parseFloat(e.amount), 0) || 0;
-        const pendingBalance = earnings
-            ?.filter(e => e.status === 'pending')
-            .reduce((sum, e) => sum + parseFloat(e.amount), 0) || 0;
+        // Transform recent sales data
+        const transformedRecentSales = (recentSales || []).map(sale => {
+            let sellerEarnings = sale.seller_earnings || 0;
+            
+            // Calculate if not present
+            if (sellerEarnings === 0 && sale.base_price) {
+                const basePrice = sale.base_price;
+                const platformFee = basePrice * 0.15;
+                const stripeFee = (basePrice * 0.029) + 0.30;
+                sellerEarnings = basePrice - platformFee - stripeFee;
+            }
+            
+            // Convert KRW to USD if needed
+            if (sellerEarnings > 1000 && sale.currency === 'krw') {
+                sellerEarnings = sellerEarnings / USD_TO_KRW_RATE;
+            }
+
+            return {
+                id: sale.id,
+                orderNumber: sale.order_number,
+                licenseType: sale.license_type,
+                sellerEarnings: sellerEarnings,
+                createdAt: sale.created_at,
+                tracks: sale.tracks ? {
+                    id: sale.tracks.id,
+                    trackName: sale.tracks.track_name,
+                    trackImage: sale.tracks.track_image
+                } : null,
+                buyer: sale.buyer ? {
+                    id: sale.buyer.id,
+                    firstName: sale.buyer.first_name,
+                    lastName: sale.buyer.last_name
+                } : null
+            };
+        });
+
+        console.log('Creator stats calculated:', {
+            totalTracks,
+            totalSales,
+            totalEarnings: totalEarnings.toFixed(2),
+            availableBalance: availableBalance.toFixed(2),
+            pendingBalance: pendingBalance.toFixed(2)
+        });
 
         res.json({
             success: true,
@@ -3786,14 +4406,15 @@ app.get('/api/creator/stats/:userId', async (req, res) => {
                 totalEarnings: Math.round(totalEarnings * 100) / 100,
                 availableBalance: Math.round(availableBalance * 100) / 100,
                 pendingBalance: Math.round(pendingBalance * 100) / 100,
-                recentSales: toCamelCase(recentSales || [])
+                recentSales: transformedRecentSales
             }
         });
+
     } catch (error) {
-        console.error('Get creator stats error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Internal server error'
+        console.error('Creator stats error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
         });
     }
 });
