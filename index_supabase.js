@@ -7,6 +7,8 @@ const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 const app = express();
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const bcrypt = require('bcrypt');
+const saltRounds = 10; // You can adjust this value (10-12 is good) 
 
 app.use(cors());
 app.use((req, res, next) => {
@@ -187,31 +189,73 @@ const toSnakeCase = (obj) => {
     return result;
 };
 
-// User Authentication APIs
 app.post('/api/signup', async (req, res) => {
     try {
-        const { firstName, lastName, email, password } = req.body;
+        const { firstName, lastName, email, password, username, phone } = req.body;
 
-        // Check if user already exists
-        const { data: existingUser, error: checkError } = await supabase
+        // Validate required fields
+        if (!firstName || !lastName || !email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: 'First name, last name, email, and password are required'
+            });
+        }
+
+        // Check if user already exists by email
+        const { data: existingUserByEmail } = await supabase
             .from('users')
             .select('id')
             .eq('email', email)
             .single();
 
-        if (existingUser) {
+        if (existingUserByEmail) {
             return res.status(400).json({
                 success: false,
                 message: 'User with this email already exists'
             });
         }
 
-        // Create new user
+        // Check if username is provided and unique
+        if (username) {
+            const { data: existingUserByUsername } = await supabase
+                .from('users')
+                .select('id')
+                .eq('username', username)
+                .single();
+
+            if (existingUserByUsername) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Username already taken'
+                });
+            }
+        }
+
+        // Hash the password
+        let hashedPassword;
+        try {
+            hashedPassword = await bcrypt.hash(password, saltRounds);
+        } catch (hashError) {
+            console.error('Password hashing error:', hashError);
+            return res.status(500).json({
+                success: false,
+                message: 'Error processing password'
+            });
+        }
+
+        // Create new user with default values
         const userData = {
             first_name: firstName,
             last_name: lastName,
-            email,
-            password, // Note: In production, you should hash the password
+            email: email,
+            password: hashedPassword, // Store hashed password
+            username: username || null,
+            phone: phone || null,
+            role: 'user', // Default role
+            is_admin: false, // Default admin status
+            is_creator: false, // Default creator status
+            is_buyer: true, // Default buyer status
+            profile_picture: '', // Default empty profile picture
             social_links: {
                 facebook: '',
                 twitter: '',
@@ -219,7 +263,9 @@ app.post('/api/signup', async (req, res) => {
                 youtube: '',
                 linkedin: '',
                 website: ''
-            }
+            },
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
         };
 
         const { data: user, error } = await supabase
@@ -229,13 +275,30 @@ app.post('/api/signup', async (req, res) => {
             .single();
 
         if (error) {
+            console.error('Supabase insert error:', error);
             return handleDatabaseError(error, res, 'signup');
         }
+
+        // Return user without password
+        const userResponse = {
+            id: user.id,
+            firstName: user.first_name,
+            lastName: user.last_name,
+            email: user.email,
+            username: user.username,
+            phone: user.phone,
+            role: user.role || 'user',
+            isAdmin: user.is_admin || false,
+            isCreator: user.is_creator || false,
+            isBuyer: user.is_buyer || true,
+            profilePicture: user.profile_picture,
+            createdAt: user.created_at
+        };
 
         res.status(201).json({
             success: true,
             message: 'User created successfully',
-            user: toCamelCase(user)
+            user: userResponse
         });
     } catch (error) {
         console.error('Signup error:', error);
@@ -250,34 +313,311 @@ app.post('/api/signin', async (req, res) => {
     try {
         const { email, password } = req.body;
 
+        if (!email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: 'Email/username and password are required'
+            });
+        }
+
+        // Determine if login is by email or username
+        let queryField = 'email';
+        let queryValue = email;
+
+        // Check if input is email or username
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            queryField = 'username';
+            queryValue = email;
+        }
+
+        // Find user by email or username
         const { data: user, error } = await supabase
             .from('users')
             .select('*')
-            .eq('email', email)
+            .eq(queryField, queryValue)
             .single();
 
         if (error || !user) {
+            console.log(`User not found with ${queryField}: ${queryValue}`);
             return res.status(401).json({
                 success: false,
                 message: 'Invalid email/username or password'
             });
         }
 
-        // Check password (in production, you should compare hashed passwords)
-        if (user.password !== password) {
+        // Check if password is hashed (legacy check)
+        let isPasswordValid;
+        if (user.password.startsWith('$2b$') || user.password.startsWith('$2a$')) {
+            // Password is bcrypt hashed
+            isPasswordValid = await bcrypt.compare(password, user.password);
+        } else {
+            // Legacy plain text password (for migration)
+            console.warn(`User ${user.id} has plain text password, migrating to bcrypt...`);
+            isPasswordValid = user.password === password;
+            
+            // If password is valid, hash it and update in database
+            if (isPasswordValid) {
+                const hashedPassword = await bcrypt.hash(password, saltRounds);
+                await supabase
+                    .from('users')
+                    .update({ 
+                        password: hashedPassword,
+                        updated_at: new Date().toISOString()
+                    })
+                    .eq('id', user.id);
+                console.log(`Migrated password for user ${user.id} to bcrypt`);
+            }
+        }
+
+        if (!isPasswordValid) {
             return res.status(401).json({
                 success: false,
                 message: 'Invalid email or password'
             });
         }
 
+        // Return user with role information (without password)
+        const userResponse = {
+            id: user.id,
+            firstName: user.first_name,
+            lastName: user.last_name,
+            email: user.email,
+            username: user.username,
+            phone: user.phone,
+            role: user.role || 'user',
+            isAdmin: user.is_admin || false,
+            isCreator: user.is_creator || false,
+            isBuyer: user.is_buyer || true,
+            profilePicture: user.profile_picture,
+            createdAt: user.created_at
+        };
+
         res.json({
             success: true,
             message: 'Login successful',
-            user: toCamelCase(user)
+            user: userResponse
         });
     } catch (error) {
         console.error('Signin error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error'
+        });
+    }
+});
+
+// Add password migration endpoint for existing users
+app.post('/api/migrate-passwords', async (req, res) => {
+    try {
+        // Get all users with plain text passwords
+        const { data: users, error } = await supabase
+            .from('users')
+            .select('id, password')
+            .not('password', 'like', '$2b$%')
+            .not('password', 'like', '$2a$%');
+
+        if (error) {
+            console.error('Error fetching users:', error);
+            return res.status(500).json({ success: false, message: 'Error fetching users' });
+        }
+
+        if (!users || users.length === 0) {
+            return res.json({ 
+                success: true, 
+                message: 'No users need password migration',
+                migrated: 0 
+            });
+        }
+
+        let migratedCount = 0;
+        let failedCount = 0;
+
+        // Migrate each user's password
+        for (const user of users) {
+            try {
+                const hashedPassword = await bcrypt.hash(user.password, saltRounds);
+                
+                const { error: updateError } = await supabase
+                    .from('users')
+                    .update({ 
+                        password: hashedPassword,
+                        updated_at: new Date().toISOString()
+                    })
+                    .eq('id', user.id);
+
+                if (updateError) {
+                    console.error(`Failed to migrate user ${user.id}:`, updateError);
+                    failedCount++;
+                } else {
+                    migratedCount++;
+                    console.log(`Migrated password for user ${user.id}`);
+                }
+            } catch (hashError) {
+                console.error(`Error hashing password for user ${user.id}:`, hashError);
+                failedCount++;
+            }
+        }
+
+        res.json({
+            success: true,
+            message: `Password migration completed: ${migratedCount} migrated, ${failedCount} failed`,
+            migrated: migratedCount,
+            failed: failedCount
+        });
+
+    } catch (error) {
+        console.error('Password migration error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error during password migration'
+        });
+    }
+});
+
+
+// =====================================================
+// ADMIN MANAGEMENT APIs
+// =====================================================
+
+// Get all admins (admin only)
+app.get('/api/admin/admins', async (req, res) => {
+    try {
+        // Add authentication check here
+        const { data: admins, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('is_admin', true)
+            .order('created_at', { ascending: false });
+
+        if (error) {
+            return handleDatabaseError(error, res, 'get admins');
+        }
+
+        res.json({
+            success: true,
+            admins: admins.map(admin => ({
+                id: admin.id,
+                firstName: admin.first_name,
+                lastName: admin.last_name,
+                email: admin.email,
+                username: admin.username,
+                role: admin.role,
+                isAdmin: admin.is_admin,
+                createdAt: admin.created_at
+            }))
+        });
+    } catch (error) {
+        console.error('Get admins error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error'
+        });
+    }
+});
+
+// Create new admin (admin only)
+app.post('/api/admin/admins', async (req, res) => {
+    try {
+        const { firstName, lastName, email, username, password, role = 'admin' } = req.body;
+
+        // Check if user already exists
+        const { data: existingUser } = await supabase
+            .from('users')
+            .select('id')
+            .or(`email.eq.${email},username.eq.${username}`)
+            .single();
+
+        if (existingUser) {
+            return res.status(400).json({
+                success: false,
+                message: 'User with this email or username already exists'
+            });
+        }
+
+        // Create admin user
+        const adminData = {
+            first_name: firstName,
+            last_name: lastName,
+            email: email,
+            username: username,
+            password: password, // In production, hash this
+            role: role,
+            is_admin: true,
+            is_creator: false,
+            is_buyer: false
+        };
+
+        const { data: admin, error } = await supabase
+            .from('users')
+            .insert([adminData])
+            .select()
+            .single();
+
+        if (error) {
+            return handleDatabaseError(error, res, 'create admin');
+        }
+
+        res.status(201).json({
+            success: true,
+            message: 'Admin created successfully',
+            admin: {
+                id: admin.id,
+                firstName: admin.first_name,
+                lastName: admin.last_name,
+                email: admin.email,
+                username: admin.username,
+                role: admin.role
+            }
+        });
+    } catch (error) {
+        console.error('Create admin error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error'
+        });
+    }
+});
+
+// Update user role (admin only)
+app.put('/api/admin/users/:id/role', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { role, isAdmin, isCreator, isBuyer } = req.body;
+
+        const updateData = {};
+        if (role !== undefined) updateData.role = role;
+        if (isAdmin !== undefined) updateData.is_admin = isAdmin;
+        if (isCreator !== undefined) updateData.is_creator = isCreator;
+        if (isBuyer !== undefined) updateData.is_buyer = isBuyer;
+
+        const { data: user, error } = await supabase
+            .from('users')
+            .update(updateData)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) {
+            return handleDatabaseError(error, res, 'update user role');
+        }
+
+        res.json({
+            success: true,
+            message: 'User role updated successfully',
+            user: {
+                id: user.id,
+                firstName: user.first_name,
+                lastName: user.last_name,
+                email: user.email,
+                role: user.role,
+                isAdmin: user.is_admin,
+                isCreator: user.is_creator,
+                isBuyer: user.is_buyer
+            }
+        });
+    } catch (error) {
+        console.error('Update user role error:', error);
         res.status(500).json({
             success: false,
             message: 'Internal server error'
@@ -602,23 +942,115 @@ app.put('/api/profile/:userId', async (req, res) => {
     }
 });
 
-app.get('/api/users', async (req, res) => {
+app.post('/api/users', async (req, res) => {
     try {
-        const { data: users, error } = await supabase
-            .from('users')
-            .select('*')
-            .order('created_at', { ascending: false });
+        const { firstName, lastName, email, username, password, phone, profilePicture, role, isAdmin, isCreator, isBuyer } = req.body;
 
-        if (error) {
-            return handleDatabaseError(error, res, 'get users');
+        // Validate required fields
+        if (!firstName || !lastName || !email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: 'First name, last name, email, and password are required'
+            });
         }
 
-        res.status(200).json({
+        // Check if user with email already exists
+        const { data: existingUserByEmail } = await supabase
+            .from('users')
+            .select('id')
+            .eq('email', email)
+            .single();
+
+        if (existingUserByEmail) {
+            return res.status(400).json({
+                success: false,
+                message: 'User with this email already exists'
+            });
+        }
+
+        // Check if username is provided and unique
+        if (username) {
+            const { data: existingUserByUsername } = await supabase
+                .from('users')
+                .select('id')
+                .eq('username', username)
+                .single();
+
+            if (existingUserByUsername) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Username already taken'
+                });
+            }
+        }
+
+        // Hash the password
+        let hashedPassword;
+        try {
+            hashedPassword = await bcrypt.hash(password, saltRounds);
+        } catch (hashError) {
+            console.error('Password hashing error:', hashError);
+            return res.status(500).json({
+                success: false,
+                message: 'Error processing password'
+            });
+        }
+
+        const userData = {
+            first_name: firstName,
+            last_name: lastName,
+            email,
+            username: username || null,
+            password: hashedPassword, // Store hashed password
+            phone: phone || null,
+            profile_picture: profilePicture || '',
+            role: role || 'user',
+            is_admin: isAdmin || false,
+            is_creator: isCreator || false,
+            is_buyer: isBuyer !== undefined ? isBuyer : true,
+            social_links: {
+                facebook: '',
+                twitter: '',
+                instagram: '',
+                youtube: '',
+                linkedin: '',
+                website: ''
+            }
+        };
+
+        const { data: user, error } = await supabase
+            .from('users')
+            .insert([userData])
+            .select()
+            .single();
+
+        if (error) {
+            return handleDatabaseError(error, res, 'user creation');
+        }
+
+        // Return user without password
+        const userResponse = {
+            id: user.id,
+            firstName: user.first_name,
+            lastName: user.last_name,
+            email: user.email,
+            username: user.username,
+            phone: user.phone,
+            role: user.role || 'user',
+            isAdmin: user.is_admin || false,
+            isCreator: user.is_creator || false,
+            isBuyer: user.is_buyer || true,
+            profilePicture: user.profile_picture,
+            createdAt: user.created_at
+        };
+
+        res.status(201).json({
             success: true,
-            users: toCamelCase(users)
+            message: 'User created successfully',
+            user: userResponse
         });
     } catch (error) {
-        console.error('Get users error:', error);
+        console.error('Create user error:', error);
         res.status(500).json({
             success: false,
             message: 'Internal server error'
@@ -1937,6 +2369,8 @@ app.post('/api/sound-kits', async (req, res) => {
 
 app.get('/api/sound-kits', async (req, res) => {
     try {
+        console.log('Fetching sound kits from Supabase...');
+        
         const { data: soundKits, error } = await supabase
             .from('sound_kits')
             .select('*')
@@ -1944,18 +2378,193 @@ app.get('/api/sound-kits', async (req, res) => {
             .order('created_at', { ascending: false });
 
         if (error) {
-            return handleDatabaseError(error, res, 'get sound kits');
+            console.error('Supabase error fetching sound kits:', error);
+            return res.status(500).json({
+                success: false,
+                message: 'Database error',
+                error: error.message
+            });
         }
+
+        console.log(`Found ${soundKits?.length || 0} sound kits`);
 
         res.json({
             success: true,
-            soundKits: toCamelCase(soundKits)
+            soundKits: soundKits ? toCamelCase(soundKits) : []
         });
     } catch (error) {
         console.error('Get sound kits error:', error);
         res.status(500).json({
             success: false,
-            message: 'Internal server error'
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+});
+
+
+// Get dashboard data - FIXED
+app.get('/api/dashboard-data', async (req, res) => {
+    try {
+        console.log('Fetching dashboard data...');
+
+        // Get tracks count and top tracks
+        const { data: tracks, error: tracksError } = await supabase
+            .from('tracks')
+            .select('id, track_name, musician, view_count, play_count, sales_count')
+            .eq('is_active', true)
+            .order('view_count', { ascending: false })
+            .limit(5);
+
+        if (tracksError) {
+            console.error('Error fetching tracks:', tracksError);
+        }
+
+        // Get sound kits count and top sound kits
+        const { data: soundKits, error: soundKitsError } = await supabase
+            .from('sound_kits')
+            .select('id, kit_name, musician, price, created_at')
+            .eq('is_active', true)
+            .order('created_at', { ascending: false })
+            .limit(5);
+
+        if (soundKitsError) {
+            console.error('Error fetching sound kits:', soundKitsError);
+        }
+
+        // Get users count
+        const { data: users, error: usersError } = await supabase
+            .from('users')
+            .select('id', { count: 'exact' });
+
+        if (usersError) {
+            console.error('Error fetching users:', usersError);
+        }
+
+        // Calculate totals
+        const totalTracks = tracks?.length || 0;
+        const totalSoundKits = soundKits?.length || 0;
+        const totalUsers = users?.length || 0;
+        const totalRevenue = 0; // Calculate from sales if you have that table
+
+        res.json({
+            success: true,
+            data: {
+                totalTracks,
+                totalSoundKits,
+                totalUsers,
+                totalRevenue,
+                topTracks: tracks ? toCamelCase(tracks) : [],
+                topSoundKits: soundKits ? toCamelCase(soundKits) : []
+            }
+        });
+    } catch (error) {
+        console.error('Dashboard data error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch dashboard data',
+            error: error.message
+        });
+    }
+});
+
+// Create sound kit with files - FIXED
+app.post('/api/sound-kits-with-files', upload.fields([
+    { name: 'kitImage', maxCount: 1 },
+    { name: 'kitFile', maxCount: 1 },
+    { name: 'musicianProfilePicture', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        console.log('Creating sound kit with files...');
+        console.log('Request body:', req.body);
+        console.log('Request files:', req.files);
+
+        const {
+            kitName, kitId, description, category, price, musician,
+            kitType, bpm, key, tags, publish, seoTitle, metaKeyword, metaDescription
+        } = req.body;
+
+        // Handle file uploads
+        let kitImageId = null;
+        let kitFileId = null;
+        let musicianProfilePictureId = null;
+
+        if (req.files) {
+            const files = req.files;
+            
+            if (files.kitImage && files.kitImage[0]) {
+                kitImageId = files.kitImage[0].id;
+            }
+            if (files.kitFile && files.kitFile[0]) {
+                kitFileId = files.kitFile[0].id;
+            }
+            if (files.musicianProfilePicture && files.musicianProfilePicture[0]) {
+                musicianProfilePictureId = files.musicianProfilePicture[0].id;
+            }
+        }
+
+        // Parse arrays
+        let parsedCategory = [];
+        try {
+            parsedCategory = typeof category === 'string' ? JSON.parse(category) : category || [];
+        } catch (e) {
+            parsedCategory = [];
+        }
+
+        let parsedTags = [];
+        try {
+            parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags || [];
+        } catch (e) {
+            parsedTags = [];
+        }
+
+        const soundKitData = {
+            kit_name: kitName || '',
+            kit_id: kitId || '',
+            description: description || '',
+            category: parsedCategory,
+            price: price && !isNaN(parseFloat(price)) ? parseFloat(price) : 0,
+            musician: musician || '',
+            kit_type: kitType || '',
+            bpm: bpm && !isNaN(parseInt(bpm)) ? parseInt(bpm) : null,
+            key: key || '',
+            kit_image: kitImageId,
+            kit_file: kitFileId,
+            musician_profile_picture: musicianProfilePictureId,
+            tags: parsedTags,
+            publish: publish || 'Private',
+            seo_title: seoTitle || '',
+            meta_keyword: metaKeyword || '',
+            meta_description: metaDescription || '',
+            is_active: true
+        };
+
+        console.log('Inserting sound kit data:', soundKitData);
+
+        const { data: soundKit, error } = await supabase
+            .from('sound_kits')
+            .insert([soundKitData])
+            .select()
+            .single();
+
+        if (error) {
+            console.error('Supabase insert error:', error);
+            return handleDatabaseError(error, res, 'sound kit creation');
+        }
+
+        console.log('Sound kit created successfully:', soundKit);
+
+        res.status(201).json({
+            success: true,
+            message: 'Sound kit created successfully',
+            soundKit: toCamelCase(soundKit)
+        });
+    } catch (error) {
+        console.error('Sound kit with files creation error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
         });
     }
 });
@@ -4440,8 +5049,11 @@ app.get('/api/marketplace', async (req, res) => {
         let query = supabase
             .from('tracks')
             .select('*', { count: 'exact' })
-            .eq('publish', 'Public')
             .eq('is_sold_exclusive', false);
+
+        // FIX: Don't filter by publish status, or make it more inclusive
+        // Only exclude explicitly private tracks
+        query = query.or('publish.eq.Public,publish.is.null');
 
         // Apply filters
         if (genre) {
