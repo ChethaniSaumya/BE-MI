@@ -6,18 +6,39 @@ const { createClient } = require('@supabase/supabase-js');
 const { v4: uuidv4 } = require('uuid');
 const nodemailer = require('nodemailer');
 const app = express();
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const bcrypt = require('bcrypt');
 const saltRounds = 10; // You can adjust this value (10-12 is good) 
 
 app.use(cors());
-app.use((req, res, next) => {
-    if (req.originalUrl === '/api/webhook/stripe') {
-        next();
-    } else {
-        express.json()(req, res, next);
+app.use(express.json());
+
+// =====================================================
+// PAYPAL CONFIGURATION
+// =====================================================
+const PAYPAL_BASE_URL = process.env.PAYPAL_BASE_URL || 'https://api-m.sandbox.paypal.com';
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+
+// Get PayPal access token
+async function getPayPalAccessToken() {
+    const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+
+    const response = await fetch(`${PAYPAL_BASE_URL}/v1/oauth2/token`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Basic ${auth}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: 'grant_type=client_credentials'
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+        console.error('PayPal token error:', data);
+        throw new Error('Failed to get PayPal access token');
     }
-});
+    return data.access_token;
+}
 
 
 // Supabase client setup
@@ -355,13 +376,13 @@ app.post('/api/signin', async (req, res) => {
             // Legacy plain text password (for migration)
             console.warn(`User ${user.id} has plain text password, migrating to bcrypt...`);
             isPasswordValid = user.password === password;
-            
+
             // If password is valid, hash it and update in database
             if (isPasswordValid) {
                 const hashedPassword = await bcrypt.hash(password, saltRounds);
                 await supabase
                     .from('users')
-                    .update({ 
+                    .update({
                         password: hashedPassword,
                         updated_at: new Date().toISOString()
                     })
@@ -423,10 +444,10 @@ app.post('/api/migrate-passwords', async (req, res) => {
         }
 
         if (!users || users.length === 0) {
-            return res.json({ 
-                success: true, 
+            return res.json({
+                success: true,
                 message: 'No users need password migration',
-                migrated: 0 
+                migrated: 0
             });
         }
 
@@ -437,10 +458,10 @@ app.post('/api/migrate-passwords', async (req, res) => {
         for (const user of users) {
             try {
                 const hashedPassword = await bcrypt.hash(user.password, saltRounds);
-                
+
                 const { error: updateError } = await supabase
                     .from('users')
-                    .update({ 
+                    .update({
                         password: hashedPassword,
                         updated_at: new Date().toISOString()
                     })
@@ -912,6 +933,51 @@ app.get('/api/users/:userId', async (req, res) => {
     }
 });
 
+// Get all users - ADMIN ENDPOINT
+app.get('/api/users', async (req, res) => {
+    try {
+        console.log('Fetching all users...');
+
+        const { data: users, error } = await supabase
+            .from('users')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) {
+            console.error('Database get users error:', error);
+            return handleDatabaseError(error, res, 'get users');
+        }
+
+        // Transform users and remove 'creator' role, remove passwords
+        const transformedUsers = (users || []).map(user => {
+            const transformed = toCamelCase(user);
+
+            // Remove 'creator' role if present - only allow 'admin' or 'user'
+            if (transformed.role === 'creator') {
+                transformed.role = 'user';
+            }
+
+            // Don't expose password
+            delete transformed.password;
+
+            return transformed;
+        });
+
+        console.log(`Successfully fetched ${transformedUsers.length} users`);
+
+        res.status(200).json({
+            success: true,
+            users: transformedUsers
+        });
+    } catch (error) {
+        console.error('Get users error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error'
+        });
+    }
+});
+
 app.put('/api/profile/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
@@ -1004,7 +1070,8 @@ app.post('/api/users', async (req, res) => {
             password: hashedPassword, // Store hashed password
             phone: phone || null,
             profile_picture: profilePicture || '',
-            role: role || 'user',
+            // ✅ FIX: Only allow 'admin' or 'user' role
+            role: role === 'admin' ? 'admin' : 'user',
             is_admin: isAdmin || false,
             is_creator: isCreator || false,
             is_buyer: isBuyer !== undefined ? isBuyer : true,
@@ -1015,7 +1082,9 @@ app.post('/api/users', async (req, res) => {
                 youtube: '',
                 linkedin: '',
                 website: ''
-            }
+            },
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
         };
 
         const { data: user, error } = await supabase
@@ -1131,66 +1200,91 @@ app.delete('/api/users/:id', async (req, res) => {
     }
 });
 
-app.post('/api/users', async (req, res) => {
+// Get all musicians (creators) with their user IDs and Stripe status
+app.get('/api/musicians/all', async (req, res) => {
     try {
-        const { firstName, lastName, email, username, password, phone, profilePicture } = req.body;
+        console.log('Fetching all musicians with user data...');
 
-        // Validate required fields
-        if (!firstName || !lastName || !email || !password) {
-            return res.status(400).json({
+        // Get all unique musicians from tracks
+        const { data: tracks, error: tracksError } = await supabase
+            .from('tracks')
+            .select('musician, creator_id')
+            .not('musician', 'is', null);
+
+        if (tracksError) {
+            console.error('Tracks fetch error:', tracksError);
+            return res.status(500).json({
                 success: false,
-                message: 'First name, last name, email, and password are required'
+                message: 'Failed to fetch musicians from tracks'
             });
         }
 
-        // Check if user with email already exists
-        const { data: existingUser } = await supabase
-            .from('users')
-            .select('id')
-            .eq('email', email)
-            .single();
-
-        if (existingUser) {
-            return res.status(400).json({
-                success: false,
-                message: 'User with this email already exists'
-            });
-        }
-
-        const userData = {
-            first_name: firstName,
-            last_name: lastName,
-            email,
-            password, // Note: In production, this should be hashed
-            display_name: username || `${firstName} ${lastName}`,
-            profile_picture: profilePicture || '',
-            social_links: {
-                facebook: '',
-                twitter: '',
-                instagram: '',
-                youtube: '',
-                linkedin: '',
-                website: ''
+        // Get unique musician names and map to creator_ids
+        const musicianMap = new Map();
+        tracks.forEach(track => {
+            if (track.musician && !musicianMap.has(track.musician)) {
+                musicianMap.set(track.musician, track.creator_id);
             }
-        };
+        });
 
-        const { data: user, error } = await supabase
+        // Get all users who are creators
+        const { data: creators, error: creatorsError } = await supabase
             .from('users')
-            .insert([userData])
-            .select()
-            .single();
+            .select('id, first_name, last_name, email, stripe_account_id, stripe_payouts_enabled, is_creator')
+            .eq('is_creator', true);
 
-        if (error) {
-            return handleDatabaseError(error, res, 'user creation');
+        if (creatorsError) {
+            console.error('Creators fetch error:', creatorsError);
         }
 
-        res.status(201).json({
-            success: true,
-            message: 'User created successfully',
-            user: toCamelCase(user)
+        // Build musician list with user IDs and Stripe status
+        const musicians = [];
+
+        // Add musicians from existing tracks
+        musicianMap.forEach((creatorId, musicianName) => {
+            let creator = null;
+            if (creatorId) {
+                creator = creators?.find(c => c.id === creatorId);
+            }
+
+            musicians.push({
+                name: musicianName,
+                userId: creatorId,
+                stripeEnabled: creator?.stripe_payouts_enabled || false,
+                email: creator?.email || null,
+                firstName: creator?.first_name || '',
+                lastName: creator?.last_name || ''
+            });
         });
+
+        // Also add creators who might not have tracks yet
+        creators?.forEach(creator => {
+            const fullName = `${creator.first_name} ${creator.last_name}`.trim();
+            // Only add if not already in the list
+            if (!musicians.find(m => m.userId === creator.id)) {
+                musicians.push({
+                    name: fullName,
+                    userId: creator.id,
+                    stripeEnabled: creator.stripe_payouts_enabled || false,
+                    email: creator.email,
+                    firstName: creator.first_name,
+                    lastName: creator.last_name
+                });
+            }
+        });
+
+        // Sort by name
+        musicians.sort((a, b) => a.name.localeCompare(b.name));
+
+        console.log(`Found ${musicians.length} musicians`);
+
+        res.json({
+            success: true,
+            musicians: musicians
+        });
+
     } catch (error) {
-        console.error('Create user error:', error);
+        console.error('Get musicians error:', error);
         res.status(500).json({
             success: false,
             message: 'Internal server error'
@@ -1199,9 +1293,15 @@ app.post('/api/users', async (req, res) => {
 });
 
 // Track Management APIs
+// Updated POST /api/tracks endpoint with creator_id handling
 app.post('/api/tracks', async (req, res) => {
     try {
         const trackData = toSnakeCase(req.body);
+
+        // ADD creator_id handling - this is the key addition
+        if (req.body.creatorId) {
+            trackData.creator_id = req.body.creatorId;
+        }
 
         // Check if track with same trackId already exists
         if (trackData.track_id) {
@@ -1406,7 +1506,7 @@ app.put('/api/tracks/:id/upload', upload.fields([
     }
 });
 
-// Create track with file uploads (image and audio)
+// Updated POST /api/tracks/upload endpoint with creator_id handling
 app.post('/api/tracks/upload', upload.fields([
     { name: 'audio', maxCount: 1 },
     { name: 'image', maxCount: 1 }
@@ -1419,6 +1519,11 @@ app.post('/api/tracks/upload', upload.fields([
         const trackData = toSnakeCase(req.body);
         let audioUrl = '';
         let imageUrl = '';
+
+        // ADD creator_id handling BEFORE processing files
+        if (req.body.creatorId) {
+            trackData.creator_id = req.body.creatorId;
+        }
 
         // Handle array fields that come as indexed properties from FormData
         const arrayFields = ['genre_category', 'beat_category', 'track_tags'];
@@ -1576,6 +1681,79 @@ app.post('/api/tracks/upload', upload.fields([
         });
     } catch (error) {
         console.error('Track with files creation error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Internal server error'
+        });
+    }
+});
+
+app.get('/api/creator/earnings/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        console.log('Fetching earnings for user:', userId);
+
+        // Fetch all orders where this user is the seller
+        const { data: orders, error } = await supabase
+            .from('orders')
+            .select(`
+                *,
+                tracks (
+                    id,
+                    track_name,
+                    track_image
+                ),
+                buyer:users!orders_buyer_id_fkey (
+                    first_name,
+                    last_name,
+                    email
+                )
+            `)
+            .eq('seller_id', userId)
+            .order('created_at', { ascending: false });
+
+        if (error) {
+            console.error('Orders fetch error:', error);
+            return handleDatabaseError(error, res, 'get creator earnings');
+        }
+
+        // Transform orders into sales data
+        const sales = orders.map(order => ({
+            id: order.id,
+            orderNumber: order.order_number,
+            trackName: order.tracks?.track_name || 'Unknown Track',
+            trackImage: order.tracks?.track_image,
+            buyer: order.buyer ?
+                `${order.buyer.first_name} ${order.buyer.last_name}` :
+                'Unknown Buyer',
+            buyerEmail: order.buyer?.email,
+            licenseType: order.license_type,
+            basePrice: order.base_price,
+            platformFee: order.platform_fee,
+            sellerEarnings: order.seller_earnings,
+            totalAmount: order.total_amount,
+            status: order.status,
+            createdAt: order.created_at
+        }));
+
+        // Also get from creator_earnings table
+        const { data: earnings, error: earningsError } = await supabase
+            .from('creator_earnings')
+            .select('*')
+            .eq('user_id', userId);
+
+        if (earningsError) {
+            console.error('Creator earnings fetch error:', earningsError);
+        }
+
+        res.json({
+            success: true,
+            sales: sales,
+            earnings: earnings || []
+        });
+
+    } catch (error) {
+        console.error('Get creator earnings error:', error);
         res.status(500).json({
             success: false,
             message: 'Internal server error'
@@ -2370,7 +2548,7 @@ app.post('/api/sound-kits', async (req, res) => {
 app.get('/api/sound-kits', async (req, res) => {
     try {
         console.log('Fetching sound kits from Supabase...');
-        
+
         const { data: soundKits, error } = await supabase
             .from('sound_kits')
             .select('*')
@@ -2491,7 +2669,7 @@ app.post('/api/sound-kits-with-files', upload.fields([
 
         if (req.files) {
             const files = req.files;
-            
+
             if (files.kitImage && files.kitImage[0]) {
                 kitImageId = files.kitImage[0].id;
             }
@@ -3297,6 +3475,21 @@ app.get('/api/cart/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
 
+        // ✅ FIX: Validate userId to prevent "undefined" errors
+        if (!userId || userId === 'undefined' || userId === 'null') {
+            console.log('Invalid userId provided to cart endpoint:', userId);
+            return res.status(200).json({
+                success: true,
+                cart: {
+                    items: [],
+                    itemCount: 0,
+                    subtotal: 0,
+                    platformFee: 0,
+                    total: 0
+                }
+            });
+        }
+
         const { data: cartItems, error } = await supabase
             .from('cart_items')
             .select(`
@@ -3319,13 +3512,26 @@ app.get('/api/cart/:userId', async (req, res) => {
             .order('added_at', { ascending: false });
 
         if (error) {
-            return handleDatabaseError(error, res, 'get cart');
+            console.error('Database get cart error:', error);
+            // ✅ FIX: Return empty cart instead of error
+            return res.status(200).json({
+                success: true,
+                cart: {
+                    items: [],
+                    itemCount: 0,
+                    subtotal: 0,
+                    platformFee: 0,
+                    total: 0
+                }
+            });
         }
 
         // Calculate totals
         let subtotal = 0;
-        const items = cartItems.map(item => {
+        const items = (cartItems || []).map(item => {
             const track = item.tracks;
+            if (!track) return null;
+
             let price = track.track_price || 0;
 
             // Apply license multiplier
@@ -3344,9 +3550,9 @@ app.get('/api/cart/:userId', async (req, res) => {
                 track: toCamelCase(track),
                 price: price
             };
-        });
+        }).filter(item => item !== null);
 
-        const platformFee = Math.round(subtotal * 0.15 * 100); // 15% fee
+        const platformFee = Math.round(subtotal * 0.15 * 100) / 100;
         const total = subtotal;
 
         res.json({
@@ -3361,9 +3567,16 @@ app.get('/api/cart/:userId', async (req, res) => {
         });
     } catch (error) {
         console.error('Get cart error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Internal server error'
+        // ✅ FIX: Return empty cart on any error
+        res.status(200).json({
+            success: true,
+            cart: {
+                items: [],
+                itemCount: 0,
+                subtotal: 0,
+                platformFee: 0,
+                total: 0
+            }
         });
     }
 });
@@ -3710,10 +3923,13 @@ app.post('/api/checkout', async (req, res) => {
     }
 });*/
 
+// =====================================================
+// PAYPAL CHECKOUT - Create Order
+// =====================================================
 app.post('/api/checkout', async (req, res) => {
     try {
-        const { userId, items, currency = 'usd' } = req.body;
-        
+        const { userId, items } = req.body;
+
         if (!userId || !items || items.length === 0) {
             return res.status(400).json({
                 success: false,
@@ -3728,35 +3944,20 @@ app.post('/api/checkout', async (req, res) => {
             .eq('id', userId)
             .single();
 
-        // Determine currency and payment methods
-        const isKRW = currency.toLowerCase() === 'krw';
-        const exchangeRate = parseFloat(process.env.USD_TO_KRW_RATE) || 1450;
-        
-        // Set payment methods based on currency
-        // ONLY Card for USD, ONLY Kakao Pay + Card for KRW
-        let paymentMethodTypes;
-        if (isKRW) {
-            paymentMethodTypes = ['kakao_pay', 'card'];
-            // Commented out other Korean payment methods:
-            // 'kr_card', 'naver_pay', 'samsung_pay', 'payco'
-        } else {
-            paymentMethodTypes = ['card'];
-        }
-
-        // Build line items and calculate transfers
-        const lineItems = [];
-        const orderData = [];
+        // Build order items and calculate totals
+        const orderItems = [];
+        let totalAmount = 0;
 
         for (const item of items) {
-            // Get track with creator's Stripe account
+            // Get track with creator info
             const { data: track } = await supabase
                 .from('tracks')
                 .select(`
                     *,
                     creator:users!tracks_creator_id_fkey (
                         id,
-                        stripe_account_id,
-                        stripe_payouts_enabled
+                        paypal_email,
+                        paypal_onboarding_complete
                     )
                 `)
                 .eq('id', item.trackId)
@@ -3764,110 +3965,123 @@ app.post('/api/checkout', async (req, res) => {
 
             if (!track) continue;
 
-            // Check if creator has Stripe connected
-            if (!track.creator?.stripe_account_id || !track.creator?.stripe_payouts_enabled) {
+            // Check if creator has PayPal set up
+            if (!track.creator?.paypal_email || !track.creator?.paypal_onboarding_complete) {
                 return res.status(400).json({
                     success: false,
-                    message: `Creator for track "${track.track_name}" has not set up payouts. Please contact the creator.`
+                    message: `Creator for track "${track.track_name}" has not set up PayPal payouts. Please contact the creator.`
                 });
             }
 
-            // Calculate price based on license (in USD)
-            let priceUSD = track.track_price || 0;
+            // Determine price based on license type
+            let price = track.track_price;
             if (item.licenseType === 'commercial') {
-                priceUSD = track.commercial_price || priceUSD * 2.5;
+                price = track.commercial_price || track.track_price * 2.5;
             } else if (item.licenseType === 'exclusive') {
-                priceUSD = track.exclusive_price || priceUSD * 10;
+                price = track.exclusive_price || track.track_price * 10;
             }
 
-            // Convert to KRW if needed
-            let price = priceUSD;
-            let unitAmount;
-            
-            if (isKRW) {
-                // Convert USD to KRW (no decimals for KRW)
-                price = Math.round(priceUSD * exchangeRate);
-                unitAmount = price; // KRW doesn't use cents
-            } else {
-                unitAmount = Math.round(price * 100); // USD uses cents
-            }
+            const platformFee = Math.round(price * 0.15 * 100) / 100; // 15%
+            const sellerEarnings = Math.round((price - platformFee) * 100) / 100; // 85%
 
-            // Calculate fees
-            const platformFeePercent = 0.15;
-            const platformFee = Math.round(price * platformFeePercent * (isKRW ? 1 : 100));
-            
-            // Stripe fee: 2.9% + $0.30 (or equivalent in KRW)
-            const stripeFeePercent = 0.029;
-            const stripeFeeFixed = isKRW ? 435 : 30; // ~$0.30 in KRW
-            const stripeFee = Math.round((price * stripeFeePercent * (isKRW ? 1 : 100)) + stripeFeeFixed);
-            
-            // Seller amount after fees
-            const sellerAmount = unitAmount - platformFee - stripeFee;
-
-            console.log('=== FEE CALCULATION ===');
-            console.log('Currency:', isKRW ? 'KRW' : 'USD');
-            console.log('Price:', price, isKRW ? 'KRW' : 'USD');
-            console.log('Unit Amount:', unitAmount);
-            console.log('Platform Fee:', platformFee);
-            console.log('Stripe Fee:', stripeFee);
-            console.log('Seller Amount:', sellerAmount);
-            console.log('=======================');
-
-            lineItems.push({
-                price_data: {
-                    currency: isKRW ? 'krw' : 'usd',
-                    product_data: {
-                        name: track.track_name,
-                        description: `${item.licenseType.charAt(0).toUpperCase() + item.licenseType.slice(1)} License`,
-                        images: track.track_image ? [track.track_image] : [],
-                    },
-                    unit_amount: unitAmount,
-                },
-                quantity: 1,
+            orderItems.push({
+                trackId: track.id,
+                trackName: track.track_name,
+                sellerId: track.creator_id,
+                sellerPayPalEmail: track.creator.paypal_email,
+                licenseType: item.licenseType,
+                price: price,
+                platformFee: platformFee,
+                sellerEarnings: sellerEarnings
             });
 
-            orderData.push({
-                trackId: item.trackId,
-                licenseType: item.licenseType,
-                priceUSD: priceUSD,
-                price: isKRW ? price : priceUSD,
-                currency: isKRW ? 'krw' : 'usd',
-                sellerId: track.creator_id,
-                sellerStripeAccountId: track.creator.stripe_account_id,
-                platformFee: platformFee / (isKRW ? 1 : 100),
-                stripeFee: stripeFee / (isKRW ? 1 : 100),
-                sellerEarnings: sellerAmount / (isKRW ? 1 : 100)
+            totalAmount += price;
+        }
+
+        totalAmount = Math.round(totalAmount * 100) / 100;
+
+        // Create PayPal Order
+        const accessToken = await getPayPalAccessToken();
+
+        const paypalOrder = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                intent: 'CAPTURE',
+                purchase_units: [{
+                    amount: {
+                        currency_code: 'USD',
+                        value: totalAmount.toFixed(2),
+                        breakdown: {
+                            item_total: {
+                                currency_code: 'USD',
+                                value: totalAmount.toFixed(2)
+                            }
+                        }
+                    },
+                    items: orderItems.map(item => ({
+                        name: item.trackName,
+                        description: `${item.licenseType} license`,
+                        unit_amount: {
+                            currency_code: 'USD',
+                            value: item.price.toFixed(2)
+                        },
+                        quantity: '1',
+                        category: 'DIGITAL_GOODS'
+                    }))
+                }],
+                payment_source: {
+                    paypal: {
+                        experience_context: {
+                            payment_method_preference: 'IMMEDIATE_PAYMENT_REQUIRED',
+                            brand_name: 'Museedle',
+                            locale: 'en-US',
+                            landing_page: 'LOGIN',
+                            user_action: 'PAY_NOW',
+                            return_url: `${process.env.BACKEND_URL}/api/payment/success`,
+                            cancel_url: `${process.env.FRONTEND_URL}/user/pages/Cart`
+                        }
+                    }
+                }
+            })
+        });
+
+        const paypalData = await paypalOrder.json();
+
+        if (!paypalOrder.ok) {
+            console.error('PayPal order creation error:', paypalData);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to create PayPal order'
             });
         }
 
-        // Create Stripe Checkout Session
-        const sessionConfig = {
-            payment_method_types: paymentMethodTypes,
-            line_items: lineItems,
-            mode: 'payment',
-            success_url: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `${process.env.FRONTEND_URL}/user/pages/Cart`,
-            customer_email: buyer?.email,
-            metadata: {
-                userId: userId,
-                orderData: JSON.stringify(orderData),
-                currency: isKRW ? 'krw' : 'usd'
-            },
-            payment_intent_data: {
-                transfer_group: `ORDER-${Date.now()}`
-            }
-        };
+        // Store order data in metadata for later use (store temporarily)
+        // We'll use a simple in-memory store or database
+        await supabase
+            .from('pending_payments')
+            .insert([{
+                paypal_order_id: paypalData.id,
+                user_id: userId,
+                order_data: JSON.stringify(orderItems),
+                total_amount: totalAmount,
+                status: 'pending',
+                created_at: new Date().toISOString()
+            }]);
 
-        const session = await stripe.checkout.sessions.create(sessionConfig);
+        // Find the approval URL
+        const approvalUrl = paypalData.links?.find(link => link.rel === 'approve')?.href
+            || paypalData.links?.find(link => link.rel === 'payer-action')?.href;
 
-        console.log('Checkout session created with payment methods:', paymentMethodTypes);
+        console.log('PayPal order created:', paypalData.id);
 
         res.json({
             success: true,
-            sessionId: session.id,
-            url: session.url,
-            currency: isKRW ? 'krw' : 'usd',
-            paymentMethods: paymentMethodTypes
+            orderId: paypalData.id,
+            url: approvalUrl
         });
 
     } catch (error) {
@@ -3879,357 +4093,59 @@ app.post('/api/checkout', async (req, res) => {
     }
 });
 
-app.get('/api/checkout/currency-options', async (req, res) => {
-    try {
-        // You can use IP geolocation or browser locale
-        const acceptLanguage = req.headers['accept-language'] || '';
-        const isKorean = acceptLanguage.includes('ko');
-        
-        res.json({
-            success: true,
-            suggestedCurrency: isKorean ? 'krw' : 'usd',
-            availableCurrencies: [
-                { code: 'usd', name: 'US Dollar', symbol: '$' },
-                { code: 'krw', name: 'Korean Won', symbol: '₩' }
-            ],
-            paymentMethodsByCurrency: {
-                usd: ['card'],
-                krw: ['card', 'kakao_pay', 'naver_pay', 'samsung_pay', 'payco', 'kr_card']
-            }
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
-
+// =====================================================
+// PAYPAL - Capture Payment (after buyer approves)
+// =====================================================
 app.get('/api/payment/success', async (req, res) => {
     try {
-        const { session_id } = req.query;
-        console.log('=== PAYMENT SUCCESS ===');
-        console.log('Session ID:', session_id);
-        
-        const session = await stripe.checkout.sessions.retrieve(session_id, {
-            expand: ['payment_intent', 'payment_intent.latest_charge']
-        });
-        
-        console.log('Payment status:', session.payment_status);
-        console.log('Payment method types:', session.payment_method_types);
-        
-        if (session.payment_status === 'paid') {
-            const { userId, orderData, currency } = session.metadata;
-            const items = JSON.parse(orderData);
-            const paymentIntentId = session.payment_intent?.id || session.payment_intent;
-            const isKRW = currency === 'krw';
-            
-            console.log('Original currency:', currency);
-            console.log('Payment Intent ID:', paymentIntentId);
+        const { token } = req.query; // PayPal sends orderId as 'token'
 
-            // Get charge and balance transaction details
-            let chargeId = null;
-            let actualAmountReceived = 0;
-            let settlementCurrency = 'usd';
-            
-            try {
-                // Get the payment intent with expanded charge
-                const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId, {
-                    expand: ['latest_charge.balance_transaction']
-                });
-                
-                const charge = paymentIntent.latest_charge;
-                chargeId = typeof charge === 'string' ? charge : charge?.id;
-                
-                console.log('Charge ID:', chargeId);
-                console.log('Charge type:', typeof charge);
-                
-                if (charge && typeof charge === 'object') {
-                    // If charge is expanded, get balance transaction directly
-                    const balanceTransaction = charge.balance_transaction;
-                    
-                    if (balanceTransaction && typeof balanceTransaction === 'object') {
-                        actualAmountReceived = balanceTransaction.net;
-                        settlementCurrency = balanceTransaction.currency;
-                        console.log('Balance transaction (expanded):', balanceTransaction.id);
-                        console.log('Net amount:', actualAmountReceived, settlementCurrency);
-                    } else if (balanceTransaction && typeof balanceTransaction === 'string') {
-                        // Balance transaction is a string ID, need to retrieve it
-                        const bt = await stripe.balanceTransactions.retrieve(balanceTransaction);
-                        actualAmountReceived = bt.net;
-                        settlementCurrency = bt.currency;
-                        console.log('Balance transaction (retrieved):', bt.id);
-                        console.log('Net amount:', actualAmountReceived, settlementCurrency);
-                    } else {
-                        console.log('⚠️ Balance transaction not yet available');
-                    }
-                }
-                
-                // If balance transaction is not available yet (can happen with some payment methods),
-                // calculate from the session amount
-                if (actualAmountReceived === 0 && isKRW) {
-                    // Get the amount from the session and estimate USD conversion
-                    const amountTotal = session.amount_total; // in KRW (smallest unit)
-                    const exchangeRate = parseFloat(process.env.USD_TO_KRW_RATE) || 1450;
-                    
-                    // Convert KRW to USD cents
-                    const estimatedUSDCents = Math.round((amountTotal / exchangeRate) * 100);
-                    
-                    // Estimate Stripe fee (approximately 3.4% + $0.30 for international)
-                    const estimatedStripeFee = Math.round(estimatedUSDCents * 0.034) + 30;
-                    actualAmountReceived = estimatedUSDCents - estimatedStripeFee;
-                    
-                    console.log('=== FALLBACK CALCULATION ===');
-                    console.log('Session amount (KRW):', amountTotal);
-                    console.log('Estimated USD cents:', estimatedUSDCents);
-                    console.log('Estimated Stripe fee:', estimatedStripeFee);
-                    console.log('Estimated net (cents):', actualAmountReceived);
-                    console.log('============================');
-                }
-                
-            } catch (piError) {
-                console.error('Error retrieving payment details:', piError.message);
-                
-                // Fallback: Calculate from session amount
-                if (isKRW && session.amount_total) {
-                    const amountTotal = session.amount_total;
-                    const exchangeRate = parseFloat(process.env.USD_TO_KRW_RATE) || 1450;
-                    const estimatedUSDCents = Math.round((amountTotal / exchangeRate) * 100);
-                    const estimatedStripeFee = Math.round(estimatedUSDCents * 0.034) + 30;
-                    actualAmountReceived = estimatedUSDCents - estimatedStripeFee;
-                    
-                    console.log('=== ERROR FALLBACK CALCULATION ===');
-                    console.log('Session amount (KRW):', amountTotal);
-                    console.log('Estimated net (cents):', actualAmountReceived);
-                    console.log('==================================');
-                }
-            }
-
-            // If we still don't have chargeId, try to get it directly
-            if (!chargeId) {
-                try {
-                    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
-                    chargeId = pi.latest_charge;
-                    console.log('Retrieved charge ID separately:', chargeId);
-                } catch (e) {
-                    console.error('Could not retrieve charge ID:', e.message);
-                }
-            }
-
-            for (const item of items) {
-                const orderNumber = 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6).toUpperCase();
-                console.log('Processing order:', orderNumber);
-
-                let transferAmount;
-                let transferCurrency = settlementCurrency;
-                
-                if (isKRW) {
-                    // For KRW payments, calculate based on what platform received
-                    const platformFeeAmount = Math.round(actualAmountReceived * 0.15);
-                    transferAmount = actualAmountReceived - platformFeeAmount;
-                    
-                    console.log('=== TRANSFER CALCULATION (KRW→USD) ===');
-                    console.log('Buyer paid:', item.price, 'KRW');
-                    console.log('Platform received (after Stripe fee):', actualAmountReceived, 'cents USD');
-                    console.log('Platform keeps (15%):', platformFeeAmount, 'cents USD');
-                    console.log('Seller receives:', transferAmount, 'cents USD');
-                    console.log('=======================================');
-                } else {
-                    // For USD payments, use the pre-calculated amount
-                    transferAmount = Math.round(item.sellerEarnings * 100);
-                    
-                    console.log('=== TRANSFER CALCULATION (USD) ===');
-                    console.log('Buyer paid: $', item.price);
-                    console.log('Platform Fee: $', item.platformFee);
-                    console.log('Stripe Fee: $', item.stripeFee);
-                    console.log('Seller Earnings: $', item.sellerEarnings);
-                    console.log('Transfer Amount (cents):', transferAmount);
-                    console.log('==================================');
-                }
-                
-                // Create transfer to seller
-                if (chargeId && item.sellerStripeAccountId && transferAmount > 0) {
-                    try {
-                        const transfer = await stripe.transfers.create({
-                            amount: transferAmount,
-                            currency: transferCurrency,
-                            destination: item.sellerStripeAccountId,
-                            source_transaction: chargeId,
-                            metadata: {
-                                orderId: orderNumber,
-                                trackId: item.trackId,
-                                sellerId: item.sellerId,
-                                originalCurrency: currency,
-                                originalAmount: item.price
-                            }
-                        });
-                        console.log('✅ Transfer successful:', transfer.id, '- Amount:', transferAmount, transferCurrency.toUpperCase());
-                    } catch (transferError) {
-                        console.error('❌ Transfer error:', transferError.message);
-                        
-                        // If source_transaction fails, try without it (separate transfer)
-                        if (transferError.message.includes('source_transaction')) {
-                            try {
-                                console.log('Attempting transfer without source_transaction...');
-                                const transfer = await stripe.transfers.create({
-                                    amount: transferAmount,
-                                    currency: transferCurrency,
-                                    destination: item.sellerStripeAccountId,
-                                    metadata: {
-                                        orderId: orderNumber,
-                                        trackId: item.trackId,
-                                        sellerId: item.sellerId,
-                                        originalCurrency: currency,
-                                        originalAmount: item.price,
-                                        note: 'Transfer without source_transaction'
-                                    }
-                                });
-                                console.log('✅ Transfer successful (without source):', transfer.id);
-                            } catch (transferError2) {
-                                console.error('❌ Transfer error (retry):', transferError2.message);
-                            }
-                        }
-                    }
-                } else {
-                    console.log('⚠️ Skipping transfer - missing data or zero amount');
-                    console.log('  chargeId:', chargeId);
-                    console.log('  sellerStripeAccountId:', item.sellerStripeAccountId);
-                    console.log('  transferAmount:', transferAmount);
-                }
-
-                // Calculate seller earnings in USD for database
-                const sellerEarningsUSD = isKRW 
-                    ? (transferAmount / 100)
-                    : item.sellerEarnings;
-
-                // Create order record
-                const { data: order, error: orderError } = await supabase
-                    .from('orders')
-                    .insert([{
-                        order_number: orderNumber,
-                        buyer_id: userId,
-                        seller_id: item.sellerId,
-                        track_id: item.trackId,
-                        license_type: item.licenseType,
-                        base_price: item.priceUSD || (item.price / (parseFloat(process.env.USD_TO_KRW_RATE) || 1450)),
-                        platform_fee: isKRW ? (actualAmountReceived * 0.15 / 100) : item.platformFee,
-                        stripe_fee: item.stripeFee || 0,
-                        seller_earnings: sellerEarningsUSD,
-                        total_amount: item.priceUSD || (item.price / (parseFloat(process.env.USD_TO_KRW_RATE) || 1450)),
-                        currency: currency,
-                        status: 'completed',
-                        payment_provider: 'stripe',
-                        payment_method: isKRW ? 'kakao_pay' : 'card',
-                        payment_reference: paymentIntentId
-                    }])
-                    .select()
-                    .single();
-
-                if (orderError) {
-                    console.error('❌ Order creation error:', orderError);
-                } else {
-                    console.log('✅ Order created:', order.id);
-                }
-
-                // Record creator earnings
-                if (order) {
-                    await supabase
-                        .from('creator_earnings')
-                        .insert([{
-                            user_id: item.sellerId,
-                            order_id: order.id,
-                            track_id: item.trackId,
-                            amount: sellerEarningsUSD,
-                            currency: 'usd',
-                            status: transferAmount > 0 ? 'transferred' : 'pending'
-                        }]);
-                    console.log('✅ Creator earnings recorded: $' + sellerEarningsUSD.toFixed(2));
-                }
-
-                // Update track sales count
-                const { error: rpcError } = await supabase.rpc('increment_sales_count', { 
-                    track_id: item.trackId 
-                });
-                
-                if (rpcError) {
-                    console.error('❌ Sales count increment error:', rpcError);
-                } else {
-                    console.log('✅ Sales count incremented');
-                }
-
-                // Generate license key
-                const licenseKey = 'MSL-' + 
-                    Math.random().toString(36).substr(2, 4).toUpperCase() + '-' +
-                    Math.random().toString(36).substr(2, 4).toUpperCase() + '-' +
-                    Math.random().toString(36).substr(2, 4).toUpperCase() + '-' +
-                    Math.random().toString(36).substr(2, 4).toUpperCase();
-
-                // Add to user library
-                if (order) {
-                    await supabase
-                        .from('user_library')
-                        .insert([{
-                            user_id: userId,
-                            track_id: item.trackId,
-                            order_id: order.id,
-                            license_type: item.licenseType,
-                            license_key: licenseKey
-                        }]);
-                    console.log('✅ Added to user library');
-                }
-
-                // Clear from cart
-                await supabase
-                    .from('cart_items')
-                    .delete()
-                    .eq('user_id', userId)
-                    .eq('track_id', item.trackId);
-
-                // If exclusive license, mark track as sold
-                if (item.licenseType === 'exclusive') {
-                    await supabase
-                        .from('tracks')
-                        .update({
-                            is_sold_exclusive: true,
-                            publish: 'Private'
-                        })
-                        .eq('id', item.trackId);
-                }
-            }
-            
-            console.log('=== PAYMENT SUCCESS COMPLETE ===');
-            res.redirect(`${process.env.FRONTEND_URL}/user/pages/PaymentSuccess`);
-        } else {
-            console.log('Payment not completed, status:', session.payment_status);
-            res.redirect(`${process.env.FRONTEND_URL}/user/pages/Cart?error=payment_failed`);
+        if (!token) {
+            return res.redirect(`${process.env.FRONTEND_URL}/user/pages/Cart?error=missing_token`);
         }
-    } catch (error) {
-        console.error('Payment success error:', error);
-        res.redirect(`${process.env.FRONTEND_URL}/user/pages/Cart?error=processing_failed`);
-    }
-});
 
-// Stripe webhook to handle payment completion
-app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
+        // Capture the PayPal order
+        const accessToken = await getPayPalAccessToken();
 
-    try {
-        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-        return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
+        const captureResponse = await fetch(`${PAYPAL_BASE_URL}/v2/checkout/orders/${token}/capture`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            }
+        });
 
-    if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-        const { userId, orderData } = session.metadata;
-        const items = JSON.parse(orderData);
+        const captureData = await captureResponse.json();
 
-        // Create orders and add to library
+        if (captureData.status !== 'COMPLETED') {
+            console.error('Payment not completed:', captureData);
+            return res.redirect(`${process.env.FRONTEND_URL}/user/pages/Cart?error=payment_failed`);
+        }
+
+        console.log('✅ PayPal payment captured:', token);
+
+        // Get the pending payment data
+        const { data: pendingPayment } = await supabase
+            .from('pending_payments')
+            .select('*')
+            .eq('paypal_order_id', token)
+            .single();
+
+        if (!pendingPayment) {
+            console.error('Pending payment not found for:', token);
+            return res.redirect(`${process.env.FRONTEND_URL}/user/pages/Cart?error=order_not_found`);
+        }
+
+        const userId = pendingPayment.user_id;
+        const items = JSON.parse(pendingPayment.order_data);
+        const captureId = captureData.purchase_units?.[0]?.payments?.captures?.[0]?.id || token;
+
+        // Process each item - create orders, library entries, and payouts
         for (const item of items) {
             const orderNumber = 'ORD-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6).toUpperCase();
-            const platformFee = Math.round(item.price * 0.15 * 100);
-            const sellerEarnings = item.price - platformFee;
 
-            // Create order
-            const { data: order } = await supabase
+            // Create order in database
+            const { data: order, error: orderError } = await supabase
                 .from('orders')
                 .insert([{
                     order_number: orderNumber,
@@ -4238,29 +4154,36 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
                     track_id: item.trackId,
                     license_type: item.licenseType,
                     base_price: item.price,
-                    platform_fee: platformFee,
-                    seller_earnings: sellerEarnings,
+                    platform_fee: item.platformFee,
+                    seller_earnings: item.sellerEarnings,
                     total_amount: item.price,
+                    currency: 'usd',
                     status: 'completed',
-                    payment_provider: 'stripe',
-                    payment_reference: session.payment_intent
+                    payment_provider: 'paypal',
+                    payment_method: 'paypal',
+                    payment_reference: captureId
                 }])
                 .select()
                 .single();
 
-            // INSERT creator earnings
+            if (orderError) {
+                console.error('❌ Order creation error:', orderError);
+                continue;
+            }
+
+            console.log('✅ Order created:', order.id);
+
+            // Record creator earnings
             await supabase
                 .from('creator_earnings')
                 .insert([{
                     user_id: item.sellerId,
                     order_id: order.id,
                     track_id: item.trackId,
-                    amount: sellerEarnings,
-                    status: 'available'
+                    amount: item.sellerEarnings,
+                    currency: 'usd',
+                    status: 'pending_payout'
                 }]);
-
-            // Update track sales count
-            await supabase.rpc('increment_sales_count', { track_id: item.trackId });
 
             // Generate license key
             const licenseKey = 'MSL-' +
@@ -4269,7 +4192,7 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
                 Math.random().toString(36).substr(2, 4).toUpperCase() + '-' +
                 Math.random().toString(36).substr(2, 4).toUpperCase();
 
-            // Add to library
+            // Add to user library
             await supabase
                 .from('user_library')
                 .insert([{
@@ -4280,7 +4203,10 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
                     license_key: licenseKey
                 }]);
 
-            // Clear cart
+            // Update track sales count
+            await supabase.rpc('increment_sales_count', { track_id: item.trackId });
+
+            // Clear from cart
             await supabase
                 .from('cart_items')
                 .delete()
@@ -4297,10 +4223,71 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
                     })
                     .eq('id', item.trackId);
             }
-        }
-    }
 
-    res.json({ received: true });
+            // ====================================
+            // PAY THE CREATOR VIA PAYPAL PAYOUTS
+            // ====================================
+            try {
+                const payoutResponse = await fetch(`${PAYPAL_BASE_URL}/v1/payments/payouts`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        sender_batch_header: {
+                            sender_batch_id: `PAYOUT-${order.id}-${Date.now()}`,
+                            email_subject: 'You have a payment from Museedle!',
+                            email_message: `You earned $${item.sellerEarnings.toFixed(2)} from the sale of "${item.trackName}"`
+                        },
+                        items: [{
+                            recipient_type: 'EMAIL',
+                            amount: {
+                                value: item.sellerEarnings.toFixed(2),
+                                currency: 'USD'
+                            },
+                            receiver: item.sellerPayPalEmail,
+                            note: `Payment for track: ${item.trackName} (${item.licenseType} license)`,
+                            sender_item_id: order.id
+                        }]
+                    })
+                });
+
+                const payoutData = await payoutResponse.json();
+
+                if (payoutResponse.ok) {
+                    console.log('✅ Creator payout initiated:', payoutData.batch_header?.payout_batch_id);
+
+                    // Update earnings status
+                    await supabase
+                        .from('creator_earnings')
+                        .update({
+                            status: 'paid',
+                            payout_reference: payoutData.batch_header?.payout_batch_id
+                        })
+                        .eq('order_id', order.id);
+                } else {
+                    console.error('❌ Payout error:', payoutData);
+                    // Earnings stay as 'pending_payout' - admin can retry later
+                }
+            } catch (payoutError) {
+                console.error('❌ Payout failed:', payoutError.message);
+            }
+        }
+
+        // Mark pending payment as completed
+        await supabase
+            .from('pending_payments')
+            .update({ status: 'completed' })
+            .eq('paypal_order_id', token);
+
+        // Redirect to success page
+        res.redirect(`${process.env.FRONTEND_URL}/user/pages/PaymentSuccess`);
+
+    } catch (error) {
+        console.error('Payment success error:', error);
+        res.redirect(`${process.env.FRONTEND_URL}/user/pages/Cart?error=processing_failed`);
+    }
 });
 
 // Complete order (after payment success)
@@ -4556,8 +4543,8 @@ app.get('/api/library/:userId', async (req, res) => {
                 trackFile: item.tracks.track_file,
                 bpm: item.tracks.bpm,
                 trackKey: item.tracks.track_key,
-                musician: item.tracks.creator 
-                    ? `${item.tracks.creator.first_name} ${item.tracks.creator.last_name}` 
+                musician: item.tracks.creator
+                    ? `${item.tracks.creator.first_name} ${item.tracks.creator.last_name}`
                     : 'Unknown Artist',
                 musicianProfilePicture: item.tracks.creator?.profile_picture
             } : null,
@@ -4850,13 +4837,13 @@ app.get('/api/creator/stats/:userId', async (req, res) => {
         if (earnings && earnings.length > 0) {
             earnings.forEach(earning => {
                 let amount = earning.amount || 0;
-                
+
                 // If amount seems to be in KRW (large number), convert to USD
                 // This handles legacy data that might have been stored incorrectly
                 if (amount > 1000 && earning.currency === 'krw') {
                     amount = amount / USD_TO_KRW_RATE;
                 }
-                
+
                 totalEarnings += amount;
 
                 // Check if earning is available (more than 7 days old) or pending
@@ -4887,7 +4874,7 @@ app.get('/api/creator/stats/:userId', async (req, res) => {
             if (orders && orders.length > 0) {
                 orders.forEach(order => {
                     let amount = order.seller_earnings || 0;
-                    
+
                     // If seller_earnings is 0 but we have base_price, calculate it
                     if (amount === 0 && order.base_price) {
                         // Seller gets 85% minus Stripe fee
@@ -4896,7 +4883,7 @@ app.get('/api/creator/stats/:userId', async (req, res) => {
                         const stripeFee = (basePrice * 0.029) + 0.30;
                         amount = basePrice - platformFee - stripeFee;
                     }
-                    
+
                     // Handle KRW amounts stored incorrectly
                     if (amount > 1000 && order.currency === 'krw') {
                         amount = amount / USD_TO_KRW_RATE;
@@ -4964,7 +4951,7 @@ app.get('/api/creator/stats/:userId', async (req, res) => {
         // Transform recent sales data
         const transformedRecentSales = (recentSales || []).map(sale => {
             let sellerEarnings = sale.seller_earnings || 0;
-            
+
             // Calculate if not present
             if (sellerEarnings === 0 && sale.base_price) {
                 const basePrice = sale.base_price;
@@ -4972,7 +4959,7 @@ app.get('/api/creator/stats/:userId', async (req, res) => {
                 const stripeFee = (basePrice * 0.029) + 0.30;
                 sellerEarnings = basePrice - platformFee - stripeFee;
             }
-            
+
             // Convert KRW to USD if needed
             if (sellerEarnings > 1000 && sale.currency === 'krw') {
                 sellerEarnings = sellerEarnings / USD_TO_KRW_RATE;
@@ -5021,9 +5008,9 @@ app.get('/api/creator/stats/:userId', async (req, res) => {
 
     } catch (error) {
         console.error('Creator stats error:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: error.message 
+        res.status(500).json({
+            success: false,
+            message: error.message
         });
     }
 });
@@ -5046,36 +5033,49 @@ app.get('/api/marketplace', async (req, res) => {
             search
         } = req.query;
 
+        console.log('Marketplace filters:', { genre, mood, minPrice, maxPrice, sortBy });
+
         let query = supabase
             .from('tracks')
             .select('*', { count: 'exact' })
-            .eq('is_sold_exclusive', false);
+            .eq('is_sold_exclusive', false)
+            .or('publish.eq.Public,publish.is.null');
 
-        // FIX: Don't filter by publish status, or make it more inclusive
-        // Only exclude explicitly private tracks
-        query = query.or('publish.eq.Public,publish.is.null');
-
-        // Apply filters
+        // Genre filter - Try multiple approaches
         if (genre) {
-            query = query.contains('genre_category', [genre]);
+            console.log('Filtering by genre:', genre);
+
+            // APPROACH 1: For TEXT[] arrays - Use ANY operator via raw filter
+            // This checks if genre exists anywhere in the array
+            query = query.filter('genre_category', 'cs', `{${genre}}`);
+
+            // APPROACH 2: Alternative - use overlap
+            // query = query.overlaps('genre_category', [genre]);
+
+            // APPROACH 3: If above don't work - convert to string search
+            // query = query.ilike('genre_category', `%${genre}%`);
         }
+
         if (mood) {
             query = query.eq('mood_type', mood);
         }
+
         if (minPrice) {
             query = query.gte('track_price', parseFloat(minPrice));
         }
+
         if (maxPrice) {
             query = query.lte('track_price', parseFloat(maxPrice));
         }
+
         if (search) {
             query = query.or(`track_name.ilike.%${search}%,musician.ilike.%${search}%`);
         }
 
-        // Apply sorting
+        // Sorting
         switch (sortBy) {
             case 'popular':
-                query = query.order('sales_count', { ascending: false });
+                query = query.order('sales_count', { ascending: false, nullsLast: true });
                 break;
             case 'price_low':
                 query = query.order('track_price', { ascending: true });
@@ -5088,14 +5088,20 @@ app.get('/api/marketplace', async (req, res) => {
                 query = query.order('created_at', { ascending: false });
         }
 
-        // Apply pagination
+        // Pagination
         const offset = (parseInt(page) - 1) * parseInt(limit);
         query = query.range(offset, offset + parseInt(limit) - 1);
 
         const { data: tracks, error, count } = await query;
 
         if (error) {
+            console.error('Marketplace query error:', error);
             return handleDatabaseError(error, res, 'get marketplace');
+        }
+
+        console.log(`Marketplace: Found ${count} tracks matching filters`);
+        if (tracks && tracks.length > 0) {
+            console.log('Sample genre_category:', tracks[0].genre_category);
         }
 
         res.json({
@@ -5116,6 +5122,132 @@ app.get('/api/marketplace', async (req, res) => {
         });
     }
 });
+
+
+app.get('/api/debug/genres', async (req, res) => {
+    try {
+        // Get sample tracks with their genre data
+        const { data: tracks, error } = await supabase
+            .from('tracks')
+            .select('id, track_name, genre_category')
+            .limit(5);
+
+        if (error) {
+            return res.json({
+                success: false,
+                error: error.message,
+                details: error
+            });
+        }
+
+        // Get all unique genres from the database
+        const { data: allTracks } = await supabase
+            .from('tracks')
+            .select('genre_category');
+
+        // Extract all unique genre values
+        const allGenres = new Set();
+        allTracks?.forEach(track => {
+            if (track.genre_category) {
+                // Handle different formats
+                if (Array.isArray(track.genre_category)) {
+                    track.genre_category.forEach(g => allGenres.add(g));
+                } else if (typeof track.genre_category === 'string') {
+                    try {
+                        const parsed = JSON.parse(track.genre_category);
+                        if (Array.isArray(parsed)) {
+                            parsed.forEach(g => allGenres.add(g));
+                        }
+                    } catch (e) {
+                        allGenres.add(track.genre_category);
+                    }
+                }
+            }
+        });
+
+        res.json({
+            success: true,
+            sample_tracks: tracks,
+            unique_genres_in_db: Array.from(allGenres),
+            total_tracks: allTracks?.length
+        });
+    } catch (error) {
+        res.json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ================================================================
+// THEN: Test different filter methods
+// ================================================================
+
+app.get('/api/debug/test-genre-filter', async (req, res) => {
+    const { genre = 'Pop' } = req.query;
+
+    try {
+        console.log('Testing genre filter for:', genre);
+
+        // Method 1: Using contains
+        const { data: method1, error: error1 } = await supabase
+            .from('tracks')
+            .select('id, track_name, genre_category')
+            .contains('genre_category', [genre])
+            .limit(3);
+
+        // Method 2: Using filter with cs
+        const { data: method2, error: error2 } = await supabase
+            .from('tracks')
+            .select('id, track_name, genre_category')
+            .filter('genre_category', 'cs', `["${genre}"]`)
+            .limit(3);
+
+        // Method 3: Using overlaps
+        const { data: method3, error: error3 } = await supabase
+            .from('tracks')
+            .select('id, track_name, genre_category')
+            .overlaps('genre_category', [genre])
+            .limit(3);
+
+        // Method 4: Using raw SQL
+        const { data: method4, error: error4 } = await supabase
+            .rpc('get_tracks_by_genre', { genre_name: genre });
+
+        res.json({
+            success: true,
+            genre_searched: genre,
+            results: {
+                method1_contains: {
+                    data: method1,
+                    error: error1?.message,
+                    count: method1?.length || 0
+                },
+                method2_filter_cs: {
+                    data: method2,
+                    error: error2?.message,
+                    count: method2?.length || 0
+                },
+                method3_overlaps: {
+                    data: method3,
+                    error: error3?.message,
+                    count: method3?.length || 0
+                },
+                method4_rpc: {
+                    data: method4,
+                    error: error4?.message,
+                    count: method4?.length || 0
+                }
+            }
+        });
+    } catch (error) {
+        res.json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 
 // Get single track details (for track detail page)
 app.get('/api/marketplace/track/:trackId', async (req, res) => {
@@ -5223,132 +5355,56 @@ app.get('/api/license-types', async (req, res) => {
 // --------------- Newly added ---------------
 
 // =====================================================
-// STRIPE CONNECT APIs
+// PAYPAL PAYOUT APIs (replaces Stripe Connect)
 // =====================================================
 
-// Create Stripe Connect account for creator
-app.post('/api/stripe/connect/create', async (req, res) => {
+// Save creator's PayPal email
+app.post('/api/paypal/connect', async (req, res) => {
     try {
-        const { userId } = req.body;
+        const { userId, paypalEmail } = req.body;
 
-        if (!userId) {
+        if (!userId || !paypalEmail) {
             return res.status(400).json({
                 success: false,
-                message: 'User ID is required'
+                message: 'User ID and PayPal email are required'
             });
         }
 
-        // Get user details
-        const { data: user, error: userError } = await supabase
-            .from('users')
-            .select('*')
-            .eq('id', userId)
-            .single();
-
-        if (userError || !user) {
-            return res.status(404).json({
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(paypalEmail)) {
+            return res.status(400).json({
                 success: false,
-                message: 'User not found'
+                message: 'Invalid email format'
             });
         }
 
-        // Check if user already has a Stripe account
-        if (user.stripe_account_id) {
-            return res.json({
-                success: true,
-                message: 'Stripe account already exists',
-                stripeAccountId: user.stripe_account_id
-            });
-        }
-
-        // Create Stripe Connect Express account
-        const account = await stripe.accounts.create({
-            type: 'express',
-            country: user.country || 'US',
-            email: user.email,
-            capabilities: {
-                card_payments: { requested: true },
-                transfers: { requested: true },
-            },
-            business_type: 'individual',
-            metadata: {
-                userId: userId
-            }
-        });
-
-        // Save Stripe account ID to user
-        await supabase
+        // Update user with PayPal email
+        const { data, error } = await supabase
             .from('users')
-            .update({ 
-                stripe_account_id: account.id,
-                stripe_onboarding_complete: false,
-                stripe_payouts_enabled: false
+            .update({
+                paypal_email: paypalEmail,
+                paypal_onboarding_complete: true
             })
-            .eq('id', userId);
-
-        res.json({
-            success: true,
-            message: 'Stripe Connect account created',
-            stripeAccountId: account.id
-        });
-
-    } catch (error) {
-        console.error('Stripe Connect create error:', error);
-        res.status(500).json({
-            success: false,
-            message: error.message
-        });
-    }
-});
-
-// Generate Stripe Connect onboarding link
-app.post('/api/stripe/connect/onboarding', async (req, res) => {
-    try {
-        const { userId } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({
-                success: false,
-                message: 'User ID is required'
-            });
-        }
-
-        // Get user's Stripe account ID
-        const { data: user, error: userError } = await supabase
-            .from('users')
-            .select('stripe_account_id')
             .eq('id', userId)
+            .select()
             .single();
 
-        if (userError || !user) {
-            return res.status(404).json({
+        if (error) {
+            return res.status(500).json({
                 success: false,
-                message: 'User not found'
+                message: error.message
             });
         }
-
-        if (!user.stripe_account_id) {
-            return res.status(400).json({
-                success: false,
-                message: 'No Stripe account found. Please create one first.'
-            });
-        }
-
-        // Create onboarding link
-        const accountLink = await stripe.accountLinks.create({
-            account: user.stripe_account_id,
-            refresh_url: `${process.env.FRONTEND_URL}/user/pages/UserProfile?stripe=refresh`,
-            return_url: `${process.env.FRONTEND_URL}/user/pages/UserProfile?stripe=success`,
-            type: 'account_onboarding',
-        });
 
         res.json({
             success: true,
-            url: accountLink.url
+            message: 'PayPal email saved successfully',
+            paypalEmail: paypalEmail
         });
 
     } catch (error) {
-        console.error('Stripe onboarding error:', error);
+        console.error('PayPal connect error:', error);
         res.status(500).json({
             success: false,
             message: error.message
@@ -5356,60 +5412,33 @@ app.post('/api/stripe/connect/onboarding', async (req, res) => {
     }
 });
 
-// Check Stripe Connect account status
-app.get('/api/stripe/connect/status/:userId', async (req, res) => {
+// Get PayPal payout status for a creator
+app.get('/api/paypal/status/:userId', async (req, res) => {
     try {
         const { userId } = req.params;
 
-        // Get user's Stripe account ID
-        const { data: user, error: userError } = await supabase
+        const { data: user, error } = await supabase
             .from('users')
-            .select('stripe_account_id, stripe_onboarding_complete, stripe_payouts_enabled')
+            .select('paypal_email, paypal_onboarding_complete')
             .eq('id', userId)
             .single();
 
-        if (userError || !user) {
+        if (error || !user) {
             return res.status(404).json({
                 success: false,
                 message: 'User not found'
             });
         }
 
-        if (!user.stripe_account_id) {
-            return res.json({
-                success: true,
-                connected: false,
-                onboardingComplete: false,
-                payoutsEnabled: false
-            });
-        }
-
-        // Get account details from Stripe
-        const account = await stripe.accounts.retrieve(user.stripe_account_id);
-
-        // Update database with latest status
-        const onboardingComplete = account.details_submitted;
-        const payoutsEnabled = account.payouts_enabled;
-
-        await supabase
-            .from('users')
-            .update({
-                stripe_onboarding_complete: onboardingComplete,
-                stripe_payouts_enabled: payoutsEnabled
-            })
-            .eq('id', userId);
-
         res.json({
             success: true,
-            connected: true,
-            stripeAccountId: user.stripe_account_id,
-            onboardingComplete: onboardingComplete,
-            payoutsEnabled: payoutsEnabled,
-            chargesEnabled: account.charges_enabled
+            connected: !!user.paypal_email && user.paypal_onboarding_complete,
+            paypalEmail: user.paypal_email,
+            onboardingComplete: user.paypal_onboarding_complete
         });
 
     } catch (error) {
-        console.error('Stripe status error:', error);
+        console.error('PayPal status error:', error);
         res.status(500).json({
             success: false,
             message: error.message
@@ -5417,39 +5446,69 @@ app.get('/api/stripe/connect/status/:userId', async (req, res) => {
     }
 });
 
-// Generate Stripe Dashboard link for creator
-app.post('/api/stripe/connect/dashboard', async (req, res) => {
+// Update creator's PayPal email
+app.put('/api/paypal/connect', async (req, res) => {
     try {
-        const { userId } = req.body;
+        const { userId, paypalEmail } = req.body;
 
-        // Get user's Stripe account ID
-        const { data: user, error: userError } = await supabase
-            .from('users')
-            .select('stripe_account_id')
-            .eq('id', userId)
-            .single();
-
-        if (userError || !user || !user.stripe_account_id) {
+        if (!userId || !paypalEmail) {
             return res.status(400).json({
                 success: false,
-                message: 'No Stripe account connected'
+                message: 'User ID and PayPal email are required'
             });
         }
 
-        // Create login link to Stripe Express dashboard
-        const loginLink = await stripe.accounts.createLoginLink(user.stripe_account_id);
+        const { data, error } = await supabase
+            .from('users')
+            .update({
+                paypal_email: paypalEmail,
+                paypal_onboarding_complete: true
+            })
+            .eq('id', userId)
+            .select()
+            .single();
+
+        if (error) {
+            return res.status(500).json({ success: false, message: error.message });
+        }
 
         res.json({
             success: true,
-            url: loginLink.url
+            message: 'PayPal email updated',
+            paypalEmail: paypalEmail
         });
 
     } catch (error) {
-        console.error('Stripe dashboard link error:', error);
-        res.status(500).json({
-            success: false,
-            message: error.message
+        console.error('PayPal update error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Disconnect PayPal
+app.delete('/api/paypal/connect/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        const { error } = await supabase
+            .from('users')
+            .update({
+                paypal_email: null,
+                paypal_onboarding_complete: false
+            })
+            .eq('id', userId);
+
+        if (error) {
+            return res.status(500).json({ success: false, message: error.message });
+        }
+
+        res.json({
+            success: true,
+            message: 'PayPal disconnected'
         });
+
+    } catch (error) {
+        console.error('PayPal disconnect error:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
